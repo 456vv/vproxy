@@ -1,3 +1,5 @@
+set GO111MODULE=on
+
 set GOOS=windows
 set GOARCH=386
 go build -o vproxy-win-x86.exe -ldflags="-s -w" ../vproxy/main.go
@@ -10,11 +12,3 @@ set GOARCH=386
 go build -o vproxy-linux-x86 -ldflags="-s -w" ../vproxy/main.go
 set GOARCH=arm
 go build -o vproxy-linux-arm -ldflags="-s -w" ../vproxy/main.go
-set GOOS=freebsd
-set GOARCH=386
-go build -o vproxy-freebsd-x86 -ldflags="-s -w" ../vproxy/main.go
-set GOARCH=amd64
-go build -o vproxy-freebsd-x64 -ldflags="-s -w" ../vproxy/main.go
-set GOOS=darwin
-set GOARCH=amd64
-go build -o vproxy-OS-x64 -ldflags="-s -w" ../vproxy/main.go
