@@ -12,3 +12,5 @@ set GOARCH=386
 go build -o vproxy-linux-386 -ldflags="-s -w" ../vproxy/main.go
 set GOARCH=arm
 go build -o vproxy-linux-arm -ldflags="-s -w" ../vproxy/main.go
+set GOARCH=arm64
+go build -o vproxy-linux-arm64 -ldflags="-s -w" ../vproxy/main.go

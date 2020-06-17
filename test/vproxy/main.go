@@ -33,6 +33,7 @@ var (
     fdataBufioSize = flag.Int("dataBufioSize", 1024*10, "代理数据交换缓冲区大小，单位字节")
     ftimeout = flag.Int64("timeout", 30000, "转发连接请求超时，单位毫秒")
     fkeepAlive = flag.Int64("keepAlive", 30000, "保持连接心跳检测超时，单位毫秒")
+	fBackstage	= flag.Bool("Backstage", false, "后台启动进程")
 )
 
 func main(){
@@ -93,31 +94,27 @@ func main(){
         }
     }
 
-    var err error
-    exit := make(chan bool, 1)
-    go func(){
-        defer func(){
-            p.Close()
-            exit <- true
-            close(exit)
-        }()
-        time.Sleep(time.Second)
-        log.Printf("vproxy-IP: %s\r\n", p.Addr)
-
-        var in0 string
-        for err == nil  {
-            log.Println("输入任何字符，并回车可以退出vproxy!")
-            fmt.Scan(&in0)
-            if in0 != "" {
-                return
-            }
-        }
-    }()
-    defer p.Close()
+	var err error
+    if !*fBackstage {
+		time.Sleep(time.Second)
+		go func() {
+    		defer p.Close()
+			log.Println("vproxy 启动了")
+			var in0 string
+			for err == nil {
+				log.Println("输入任何字符，并回车可以退出 vproxy!")
+				fmt.Scan(&in0)
+				if in0 != "" {
+					log.Println("vproxy 退出了")
+					return
+				}
+			}
+		}()
+	}
     err = p.ListenAndServ()
     if err != nil {
         log.Printf("vproxy-Error：%s", err)
     }
-    <-exit
+
 
 }
