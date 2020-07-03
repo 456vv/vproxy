@@ -76,7 +76,7 @@ func (hp *httpProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request){
 		return
 	}
 
-    hp.proxy.logf(Response, "", "响应：\r\n%s", forType(resp, ""))
+    hp.proxy.logf(Response, "", "响应：\r\n%s", ForType(resp, false))
 
 	wh := rw.Header()
     clearHeaders(wh)

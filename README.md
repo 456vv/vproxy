@@ -48,7 +48,6 @@ golang vproxy, HTTP/HTTPS proxy server, HTTP/HTTPS 代理服务器
 列表：
 -----------------------------------
 ```go
-const defaultDataBufioSize    = 1<<20                                            // 默认数据缓冲1MB
 type LogLevel int                                                                // 日志级别
 const
     OriginAddr LogLevel    = iota+1                                              // 客户端。
@@ -72,13 +71,9 @@ type Proxy struct {                                                      // 代�
     Transport   http.RoundTripper                                                // 代理
     ErrorLogLevel LogLevel                                                       // 日志级别
     ErrorLog    *log.Logger                                                      // 日志
-    l           net.Listener                                                     // 连接对象
 }
-    func (p *Proxy) setDefault()                                                 // 设置默认
-    func (p *Proxy) initServer() *http.Server                                    // 初始化服务器
     func (p *Proxy) ServeHTTP(rw http.ResponseWriter, req *http.Request)         // 处理
     func (p *Proxy) ListenAndServ() error                                        // 监听
     func (p *Proxy) Serve(l net.Listener) error                                  // 监听
     func (p *Proxy) Close() error                                                // 关闭代理
-
 ```
