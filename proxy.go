@@ -86,7 +86,7 @@ func (p *Proxy) ServeHTTP(rw http.ResponseWriter, req *http.Request){
 
     p.logf(Host, "", "%s Host: %s", req.Method, req.Host)
     p.logf(URI, "", "URI: %s", req.RequestURI)
-    p.logf(Request, "", "请求：\r\n%s", forType(req, ""))
+    p.logf(Request, "", "请求：\r\n%s", ForType(req, false))
 
     //请求
     switch req.Method {
