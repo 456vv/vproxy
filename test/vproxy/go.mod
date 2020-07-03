@@ -1,3 +1,7 @@
 module main
 
-require github.com/456vv/vproxy v1.0.0
+go 1.14
+
+replace github.com/456vv/vproxy => ../../
+
+require github.com/456vv/vproxy v0.0.0-00010101000000-000000000000
