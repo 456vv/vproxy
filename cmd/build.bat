@@ -12,5 +12,7 @@ set GOARM=7
 go build -o ./bin/vproxy-linux-armv7 -ldflags="-s -w" ./vproxy/main.go
 set GOARCH=arm64
 go build -o ./bin/vproxy-linux-arm64 -ldflags="-s -w" ./vproxy/main.go
+set GOARCH=mips
+go build -o ./bin/vproxy-linux-mips -ldflags="-s -w" ./vproxy/main.go
 
 upx -9 ./bin/*
