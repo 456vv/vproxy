@@ -90,7 +90,6 @@ func typeSelect(v reflect.Value) interface{} {
     }
     
    panic(fmt.Errorf("该类型 %s，无法转换为 interface 类型", v.Kind()))
-   return nil
 }
 
 func inDirect(v reflect.Value) reflect.Value {

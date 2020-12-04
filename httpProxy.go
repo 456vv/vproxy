@@ -64,7 +64,7 @@ func (hp *httpProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request){
 	outreq.Header = make(http.Header)
     filterHeaders(req.Header)
 	copyHeaders(outreq.Header, req.Header)
-
+	
 	resp, err := hp.transport.RoundTrip(outreq)
     if resp != nil {
         defer resp.Body.Close()
@@ -76,7 +76,7 @@ func (hp *httpProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request){
 		return
 	}
 
-    hp.proxy.logf(Response, "", "响应：\r\n%s", ForType(resp, false))
+    hp.proxy.logf(Response, "", "响应：\r\n%v", resp)
 
 	wh := rw.Header()
     clearHeaders(wh)
@@ -114,8 +114,6 @@ type requestCanceler interface {
 }
 
 func completionURL(req *http.Request){
-    url := req.URL
-
     //有两种方式：
     //GET / HTTP/1.1
     //Host:www.google.com
@@ -123,14 +121,14 @@ func completionURL(req *http.Request){
     //GET http://www.google.com/ HTTP/1.1
     //Host:www.google.com
     //
-    if url.Host == ""{
-        url.Host = req.Host
+    if req.URL.Host == ""{
+        req.URL.Host = req.Host
     }
-    if url.Scheme == "" {
+    if req.URL.Scheme == "" {
         if req.TLS != nil {
-            url.Scheme="https"
+            req.URL.Scheme="https"
         }else{
-            url.Scheme="http"
+            req.URL.Scheme="http"
         }
     }
 }

@@ -1,7 +1,6 @@
 set GOOS=windows
 set GOARCH=amd64
-go build -o ./bin/vproxy-win-x64.exe -ldflags="-s -w" ./vproxy/main.go
-
+go build -o ./bin/vproxy-win-amd64.exe -ldflags="-s -w" ./vproxy/main.go
 set GOOS=linux
 set GOARCH=amd64
 go build -o ./bin/vproxy-linux-amd64 -ldflags="-s -w" ./vproxy/main.go

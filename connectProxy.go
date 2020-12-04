@@ -5,6 +5,7 @@ import (
     "net"
     "context"
     "time"
+    "io"
 )
 
 var resultStatus200 = []byte("HTTP/1.1 200 Connection established\r\n\r\n")
@@ -85,7 +86,8 @@ func (cp *connectProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request){
 	}
 
     if pproxy {
-        err = req.WriteProxy(netConn)
+    	//表示还有上一级代理
+        err = req.WriteProxy(netConn.(io.Writer))
         if err != nil {
             netConn.Close()
             cp.proxy.logf(Error, "", err.Error())

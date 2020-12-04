@@ -4,6 +4,7 @@ import (
 	"github.com/456vv/vproxy"
     "net"
     "net/http"
+    //"crypto/tls"
     "net/url"
     "time"
     "flag"
@@ -20,7 +21,7 @@ var (
     fpwd = flag.String("pwd", "", "密码")
     flogLevel = flag.Int("logLevel", 0, "日志级别，0)不记录 1)客户端IP 2)认证 3)访问的Host地址 4)路径 5)请求 6)响应 7)错误 (default 0)")
     faddr = flag.String("addr", "", "代理服务器地 (format \"0.0.0.0:8080\")")
-    fproxy = flag.String("proxy", "", "代理服务器的上级代理IP地址 (format \"11.22.33.44:8888\")")
+    fproxy = flag.String("proxy", "", "代理服务器的上级代理IP地址 (format \"http://11.22.33.44:8888\" or \"socks5://admin:admin@11.22.33.44:1080\")")
     fmaxIdleConns = flag.Int("maxIdleConns", 500, "保持空闲连接(TCP)数量")
     fmaxIdleConnsPerHost = flag.Int("maxIdleConnsPerHost", 500, "保持空闲连接(Host)数量")
     fdisableKeepAlives = flag.Bool("disableKeepAlives", false, "禁止长连接 (default false)")
@@ -31,9 +32,9 @@ var (
     fresponseHeaderTimeout = flag.Int64("responseHeaderTimeout", 0, "读取服务器发来的文件标头超时，单位毫秒 (default 0)")
     fmaxResponseHeaderBytes = flag.Int64("maxResponseHeaderBytes", 0, "读取服务器发来的文件标头大小限制 (default 0)")
     fdataBufioSize = flag.Int("dataBufioSize", 1024*10, "代理数据交换缓冲区大小，单位字节")
-    ftimeout = flag.Int64("timeout", 30000, "转发连接请求超时，单位毫秒")
+    ftimeout = flag.Int64("timeout", 300000, "转发连接请求超时，单位毫秒")
     fkeepAlive = flag.Int64("keepAlive", 30000, "保持连接心跳检测超时，单位毫秒")
-	fBackstage	= flag.Bool("Backstage", false, "后台启动进程")
+    flinkPosterior = flag.Bool("linkPosterior", false, "支持连接式代理，如：http://111.222.333.444:8080/https://www.baidu.com/abc/file.zip")
 )
 
 func main(){
@@ -54,6 +55,7 @@ func main(){
     }
 	p := &vproxy.Proxy{
         Config      : &vproxy.Config{
+        	LinkPosterior: *flinkPosterior,
             DataBufioSize: *fdataBufioSize,
             Timeout: time.Duration(*ftimeout) * time.Millisecond,
             KeepAlive: time.Duration(*fkeepAlive) * time.Millisecond,
@@ -72,7 +74,7 @@ func main(){
         },
         ErrorLogLevel: vproxy.LogLevel(*flogLevel),
     }
-    p.ErrorLog = log.New(out, "", log.LstdFlags)
+    p.ErrorLog = log.New(out, "", log.Lshortfile|log.LstdFlags)
     if *fuser != "" {
         p.Config.Auth = func(username, password string) bool {
             return username == *fuser && password == *fpwd
@@ -80,38 +82,23 @@ func main(){
      }
 
     if tr, ok := p.Transport.(*http.Transport); ok && *fproxy != "" {
+		dialer := &net.Dialer{
+			Timeout:   p.Config.Timeout,
+			KeepAlive: p.Config.KeepAlive,
+			DualStack: true,
+		}
         tr.Proxy = func(r *http.Request) (*url.URL, error){
-            return r.URL, nil
+            return url.Parse(*fproxy)
         }
         tr.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error){
             ctx, cancel := context.WithTimeout(ctx, p.Config.Timeout)
             defer cancel()
-        	return (&net.Dialer{
-        			Timeout:   p.Config.Timeout,
-        			KeepAlive: p.Config.KeepAlive,
-        			DualStack: true,
-    			}).DialContext(ctx, network, *fproxy)
+        	return dialer.DialContext(ctx, network, addr)
         }
     }
 
-	var err error
-    if !*fBackstage {
-		time.Sleep(time.Second)
-		go func() {
-    		defer p.Close()
-			log.Println("vproxy 启动了")
-			var in0 string
-			for err == nil {
-				log.Println("输入任何字符，并回车可以退出 vproxy!")
-				fmt.Scan(&in0)
-				if in0 != "" {
-					log.Println("vproxy 退出了")
-					return
-				}
-			}
-		}()
-	}
-    err = p.ListenAndServ()
+   	defer p.Close()
+    err := p.ListenAndServ()
     if err != nil {
         log.Printf("vproxy-Error：%s", err)
     }
