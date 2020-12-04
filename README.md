@@ -1,10 +1,8 @@
 # vproxy [![Build Status](https://travis-ci.org/456vv/vproxy.svg?branch=master)](https://travis-ci.org/456vv/vproxy)
-golang vproxy, HTTP/HTTPS proxy server, HTTP/HTTPS 代理服务器
+golang proxy, HTTP/HTTPS proxy server, HTTP/HTTPS 代理服务器
 
 命令行：
 -----------------------------------
-    -Backstage
-        后台启动进程
     -addr string
         代理服务器地 (format "0.0.0.0:8080")
     -dataBufioSize int
@@ -19,6 +17,8 @@ golang vproxy, HTTP/HTTPS proxy server, HTTP/HTTPS 代理服务器
         空闲连接超时时，单位毫秒 (default 0)
     -keepAlive int
         保持连接心跳检测超时，单位毫秒 (default 30000)
+    -linkPosterior
+        支持连接式代理，如：http://111.222.333.444:8080/https://www.baidu.com/abc/file.zip
     -log string
         日志文件(默认留空在控制台显示日志)  (format "./vproxy.txt")
     -logLevel int
@@ -30,13 +30,13 @@ golang vproxy, HTTP/HTTPS proxy server, HTTP/HTTPS 代理服务器
     -maxResponseHeaderBytes int
         读取服务器发来的文件标头大小限制 (default 0)
     -proxy string
-        代理服务器的上级代理IP地址 (format "11.22.33.44:8888")
+        代理服务器的上级代理IP地址 (format "http://11.22.33.44:8888" or "socks5://admin:admin@11.22.33.44:1080")
     -pwd string
         密码
     -responseHeaderTimeout int
         读取服务器发来的文件标头超时，单位毫秒 (default 0)
     -timeout int
-        转发连接请求超时，单位毫秒 (default 30000)
+        转发连接请求超时，单位毫秒 (default 300000)
     -tlsHandshakeTimeout int
         SSL握手超时，单位毫秒 (default 10000)
     -user string
@@ -59,6 +59,7 @@ const
     Error                                                                        // 错误
 )
 type Config struct {                                                     // 配置
+    LinkPosterior     bool                                                       // 支持连接后面的，如：http://192.168.2.31/http://www.baidu.com/
     DataBufioSize     int                                                        // 缓冲区大小
     Auth              func(username, password string) bool                       // 认证
     Timeout           time.Duration                                              // 转发连接请求超时
