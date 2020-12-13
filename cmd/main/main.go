@@ -98,7 +98,7 @@ func main(){
     }
 
    	defer p.Close()
-    err := p.ListenAndServ()
+    err := p.ListenAndServe()
     if err != nil {
         log.Printf("vproxy-Error：%s", err)
     }
