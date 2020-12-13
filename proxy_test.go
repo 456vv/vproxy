@@ -43,7 +43,7 @@ func Test_Proxy_0(t *testing.T) {
         time.Sleep(time.Second*10)
         p.Close()
     }()
-    err := p.ListenAndServ()
+    err := p.ListenAndServe()
     if err != nil {
     	t.Logf("%s", err)
     }

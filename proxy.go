@@ -10,6 +10,7 @@ import (
     "log"
     "fmt"
     "net/url"
+    "strconv"
 )
 
 const defaultDataBufioSize    = 1<<20                                                       // 默认数据缓冲1MB
@@ -112,11 +113,21 @@ func (p *Proxy) ServeHTTP(rw http.ResponseWriter, req *http.Request){
 		}
 	}
 	
-	if localAddr, ok := req.Context().Value(http.LocalAddrContextKey).(net.Addr); ok && !rewriteHost {
-		lhost, _, _ := net.SplitHostPort(localAddr.String())
-		rhost, _, _ := net.SplitHostPort(req.RemoteAddr)
-		//rhost, _, _ := net.SplitHostPort(req.Host)
-		if lhost == rhost {
+	if localAddr, ok := req.Context().Value(http.LocalAddrContextKey).(*net.TCPAddr); ok && !rewriteHost {
+		lhost := localAddr.IP.String()
+		rhost,_,_ := net.SplitHostPort(req.RemoteAddr)
+		
+		lport := localAddr.Port
+		_, rport, _ := net.SplitHostPort(req.Host)
+		if rport == "" {
+			if req.URL.Scheme == "http" {
+				rport = "80"
+			}else if  req.URL.Scheme == "https" {
+				rport = "443"
+			}
+		}
+		//同Ip，同端口。拒绝循环
+		if lhost == rhost && strconv.Itoa(lport) == rport {
            	http.Error(rw, "Connection loopback  error!", http.StatusBadRequest)
            	return
 		}
@@ -147,10 +158,10 @@ func (p *Proxy) ServeHTTP(rw http.ResponseWriter, req *http.Request){
 //    p.logf(OriginAddr, "", "断开客户端IP: %s", req.RemoteAddr)
 }
 
-//ListenAndServ 开启监听
+//ListenAndServe 开启监听
 //  返：
 //      error       错误
-func (p *Proxy) ListenAndServ() error {
+func (p *Proxy) ListenAndServe() error {
     p.setDefault()
     srv := p.initServer()
     addr := p.Addr
