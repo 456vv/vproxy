@@ -8,19 +8,16 @@ const
     Response                                                                     // 响应
     Error                                                                        // 错误
 )
-type Config struct {                                                     // 配置
-    DataBufioSize     int                                                        // 缓冲区大小
-    Auth              func(username, password string) bool                       // 认证
-    Timeout           time.Duration                                              // 转发连接请求超时
-    Deadline          time.Time                                                  // 转发连接请求超时
-}
+
 type Proxy struct {                                                      // 代理
-    *Config                                                                      // 配置
-    Addr        string                                                           // 代理IP地址
-    Server      http.Server                                                      // 服务器
-    Transport   http.RoundTripper                                                // 代理
-    ErrorLogLevel LogLevel                                                       // 日志级别
-    ErrorLog    *log.Logger                                                      // 日志
+    LinkPosterior   bool                                                             // 支持连接后面的，如：http://192.168.2.31/http://www.baidu.com/
+    DataBufioSize   int                                                              // 缓冲区大小
+    Auth            func(username, password string) bool                             // 认证
+    Addr        string                                                               // 代理IP地址
+    Server      http.Server                                                          // 服务器
+    DialContext func(ctx context.Context, network, address string) (net.Conn, error) // 拨号
+    ErrorLog    *log.Logger                                                          // 日志
+    ErrorLogLevel LogLevel                                                           // 日志级别
 }
     func (p *Proxy) ServeHTTP(rw http.ResponseWriter, req *http.Request)         // 处理
     func (p *Proxy) ListenAndServe() error                                       // 监听

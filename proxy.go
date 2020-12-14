@@ -11,6 +11,7 @@ import (
     "fmt"
     "net/url"
     "strconv"
+    "context"
 )
 
 const defaultDataBufioSize    = 1<<20                                                       // 默认数据缓冲1MB
@@ -27,36 +28,26 @@ const (
 )
 
 
-//Config 配置
-type Config struct {
+
+type Proxy struct {
 	//这个支持单条连接。不要使用在浏览器中。
 	LinkPosterior	bool																	// 支持连接后面的，如：http://192.168.2.31/http://www.baidu.com/
     DataBufioSize   int                                                                     // 缓冲区大小
     Auth            func(username, password string) bool                                    // 认证
-    Timeout         time.Duration                                                           // 转发连接请求超时
-    KeepAlive		time.Duration															// 保持连接心跳检测超时。如果为零，保持是未启用
-    Deadline        time.Time                                                               // 转发连接请求超时
-}
-
-type Proxy struct {
-    *Config                                                                                 // 配置
     Addr        string                                                                      // 代理IP地址
     Server      http.Server                                                                 // 服务器
-    Transport   http.RoundTripper                                                           // 代理
+    DialContext	func(ctx context.Context, network, address string) (net.Conn, error)		// 拨号
     ErrorLog    *log.Logger                                                                 // 日志
     ErrorLogLevel LogLevel                                                                  // 日志级别
     l           net.Listener                                                                // 连接对象
-}
-
-//setDefault 设置默认
-func (p *Proxy) setDefault(){
-    if p.Transport == nil {
-        p.Transport = http.DefaultTransport
-    }
+    tr   		http.RoundTripper                                                           // 代理
 }
 
 //initServer 初始化服务器
 func (p *Proxy) initServer() *http.Server {
+    if p.tr == nil {
+        p.tr = http.DefaultTransport
+    }
     srv := &p.Server
     if srv.Handler == nil {
         srv.Handler = http.HandlerFunc(p.ServeHTTP)
@@ -65,31 +56,30 @@ func (p *Proxy) initServer() *http.Server {
 }
 
 //ServeHTTP 处理服务
-//  参：
-//      rw http.ResponseWriter  响应
-//      req *http.Request       请求
+//	rw http.ResponseWriter  响应
+//	req *http.Request       请求
 func (p *Proxy) ServeHTTP(rw http.ResponseWriter, req *http.Request){
-	p.logf(OriginAddr, "", "接入客户端IP: %s", req.RemoteAddr)
+	p.logf(OriginAddr, "接入客户端IP: %s", req.RemoteAddr)
     
     //认证用户密码
     if p.Auth != nil {
         auth := req.Header.Get("Proxy-Authorization")
         if auth == "" {
-            p.logf(Authenticate, "", "请求标头 Proxy-Authorization 没有被设置？")
+            p.logf(Authenticate, "请求标头 Proxy-Authorization 没有被设置？")
             http.Error(rw, "Proxy server requires authentication to log in!", http.StatusProxyAuthRequired)
             return
         }
         username, password, ok := parseBasicAuth(auth)
-        p.logf(Authenticate, "", "认证用户：%s，密码：%s", username, password)
+        p.logf(Authenticate, "认证用户：%s，密码：%s", username, password)
         if !ok || !p.Auth(username, password){
-            p.logf(Authenticate, "", "用户或密码认证不通过？")
+            p.logf(Authenticate, "用户或密码认证不通过？")
             http.Error(rw, "User or password is not valid!", http.StatusProxyAuthRequired)
             return
         }
     }
 	
 	var rewriteHost bool
-	if p.Config.LinkPosterior {
+	if p.LinkPosterior {
 		//http://www.baidu.com/		错的
 		//http://www.baidu.com/a	对的
 		if len(req.URL.Path) > 1 {
@@ -97,8 +87,8 @@ func (p *Proxy) ServeHTTP(rw http.ResponseWriter, req *http.Request){
 			if strings.Index(rawurl, "//") ==0 || strings.Index(rawurl, "http://") ==0 || strings.Index(rawurl, "https://") == 0 {
 				lpurl, err := url.Parse(rawurl)
 				if err != nil {
-    				p.logf(Host, "", "%s Host: %s", req.Method, req.Host)
-    				p.logf(URI, "", "连接路径错误: %s", req.RequestURI)
+    				p.logf(Host, "%s Host: %s", req.Method, req.Host)
+    				p.logf(URI, "连接路径错误: %s", req.RequestURI)
             		http.Error(rw, "Connection path error!", http.StatusBadRequest)
             		return
 				}
@@ -133,36 +123,30 @@ func (p *Proxy) ServeHTTP(rw http.ResponseWriter, req *http.Request){
 		}
 	}
 	
-    p.logf(Host, "", "%s Host: %s", req.Method, req.Host)
-    p.logf(URI, "", "URI: %s", req.RequestURI)
-    p.logf(Request, "", "请求：\r\n%v", req)
-
+    p.logf(Host, "%s Host: %s", req.Method, req.Host)
+    p.logf(URI, "URI: %s", req.RequestURI)
+    p.logf(Request, "请求：\r\n%v", req)
 
     //请求
     switch req.Method {
         case "CONNECT":
-            cp := &connectProxy{
-                config      : p.Config,
-                transport   : p.Transport,
-                proxy       : p,
+            cp := &proxyConnect{
+                Proxy: p,
             }
             cp.ServeHTTP(rw, req)
         default:
-            hp := &httpProxy{
-                config      : p.Config,
-                transport   : p.Transport,
-                proxy       : p,
+            hp := &proxyHTTP{
+                Proxy: p,
             }
             hp.ServeHTTP(rw, req)
     }
-//    p.logf(OriginAddr, "", "断开客户端IP: %s", req.RemoteAddr)
+//    p.logf(OriginAddr, "断开客户端IP: %s", req.RemoteAddr)
 }
 
 //ListenAndServe 开启监听
 //  返：
 //      error       错误
 func (p *Proxy) ListenAndServe() error {
-    p.setDefault()
     srv := p.initServer()
     addr := p.Addr
     if addr == "" {
@@ -184,7 +168,6 @@ func (p *Proxy) ListenAndServe() error {
 //  返：
 //      error           错误
 func (p *Proxy) Serve(l net.Listener) error{
-    p.setDefault()
     srv := p.initServer()
     p.l = l
     p.Addr = l.Addr().String()
@@ -196,7 +179,7 @@ func (p *Proxy) Serve(l net.Listener) error{
 //  返：
 //      error       错误
 func (p *Proxy) Close() error {
-    if tr, ok := p.Transport.(*http.Transport); ok {
+    if tr, ok := p.tr.(*http.Transport); ok {
         tr.CloseIdleConnections()
     }
     if p.l != nil {
@@ -205,10 +188,13 @@ func (p *Proxy) Close() error {
     return nil
 }
 
-func (p *Proxy) logf(level LogLevel, funcName, format string, v ...interface{}){
+func (p *Proxy) logf(level LogLevel, format string, v ...interface{}) error {
     if p.ErrorLog != nil && p.ErrorLogLevel >= level {
-        p.ErrorLog.Output(2, fmt.Sprintf(fmt.Sprint(funcName, "->", format, "\n"), v...))
+		err := fmt.Errorf(format+"\n", v...)
+		p.ErrorLog.Output(2, err.Error())
+		return err
     }
+    return nil
 }
 
 func copyDate(dst io.Writer, src io.ReadCloser, bufSize int) (n int64, err error){

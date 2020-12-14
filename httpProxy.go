@@ -18,20 +18,18 @@ var hopHeaders = []string{
 	//"Upgrade",
 }
 
-type httpProxy struct{
-    config      *Config
-    transport   http.RoundTripper
-    proxy       *Proxy
+type proxyHTTP struct{
+    *Proxy
 
 }
 
-func (hp *httpProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request){
+func (T *proxyHTTP) ServeHTTP(rw http.ResponseWriter, req *http.Request){
 	outreq := new(http.Request)
 	*outreq = *req
 
     //客户端关闭后，同时代理服务器的请求也取消。
 	if closeNotifier, ok := rw.(http.CloseNotifier); ok {
-		if requestCancel, ok := hp.transport.(requestCanceler); ok {
+		if requestCancel, ok := T.Proxy.tr.(requestCanceler); ok {
 			reqDone := make(chan struct{})
 			defer close(reqDone)
 
@@ -65,18 +63,18 @@ func (hp *httpProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request){
     filterHeaders(req.Header)
 	copyHeaders(outreq.Header, req.Header)
 	
-	resp, err := hp.transport.RoundTrip(outreq)
+	resp, err := T.Proxy.tr.RoundTrip(outreq)
     if resp != nil {
         defer resp.Body.Close()
     }
 	if err != nil {
-        hp.proxy.logf(Error, "", err.Error())
+        T.Proxy.logf(Error, err.Error())
         //502 服务器作为网关或者代理时，为了完成请求访问下一个服务器，但该服务器返回了非法的应答。
 		http.Error(rw, err.Error(), http.StatusBadGateway)
 		return
 	}
 
-    hp.proxy.logf(Response, "", "响应：\r\n%v", resp)
+    T.Proxy.logf(Response, "响应：\r\n%v", resp)
 
 	wh := rw.Header()
     clearHeaders(wh)
@@ -100,12 +98,11 @@ func (hp *httpProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request){
 	}
 
     var bufSize int = defaultDataBufioSize
-    if hp.config != nil && hp.config.DataBufioSize != 0 {
-        bufSize = hp.config.DataBufioSize
+    if T.Proxy.DataBufioSize != 0 {
+        bufSize = T.Proxy.DataBufioSize
     }
 
     copyDate(rw, resp.Body, bufSize)
-    //copyHeaders(rw.Header(), resp.Trailer)
 }
 
 

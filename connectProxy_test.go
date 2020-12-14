@@ -12,7 +12,6 @@ import (
     "bytes"
     "time"
     "fmt"
-    "context"
     "log"
 )
 func Test_connectProxy_ServeHTTP(t *testing.T) {
@@ -20,30 +19,21 @@ func Test_connectProxy_ServeHTTP(t *testing.T) {
         req string
         access string
     }{
-        {req:"CONNECT www.baidu.com:80 HTTP/1.0\r\nHost:abcdef\r\n\r\n", access:"GET / HTTP/1.1\r\nHost:www.baidu.com\r\nConnection:Close\r\n\r\n"},
-        {req:"CONNECT www.baidu.com:80 HTTP/1.1\r\nHost:abcdef\r\n\r\n", access:"GET / HTTP/1.1\r\nHost:www.baidu.com\r\nConnection:Close\r\n\r\n"},
+        {req:"CONNECT www.baidu.com:80 HTTP/1.0\r\nHost:www.baidu.com:80\r\n\r\n", access:"GET / HTTP/1.1\r\nHost:www.baidu.com\r\nConnection:Close\r\n\r\n"},
+        {req:"CONNECT www.baidu.com:80 HTTP/1.1\r\nHost:www.baidu.com:80\r\n\r\n", access:"GET / HTTP/1.1\r\nHost:www.baidu.com\r\nConnection:Close\r\n\r\n"},
     }
 
-    c := &Config{
-        DataBufioSize:1024,
-        Timeout: time.Second*5,
-    }
-    cp := &connectProxy{
-        config: c,
-        transport: &http.Transport{
-            //Proxy: func(req *http.Request) (*url.URL, error){
-            //    return req.URL, nil
-            //},
-            DialContext: func(ctx context.Context, network, addr string) (net.Conn, error){
-                return new(net.Dialer).DialContext(ctx, network, addr)
-            },
-        },
-        proxy : &Proxy{ErrorLog:log.New(os.Stdout, "", log.LstdFlags),ErrorLogLevel: Error},
+    cp := &proxyConnect{
+        Proxy : &Proxy{
+			ErrorLog:log.New(os.Stdout, "", log.LstdFlags),
+			ErrorLogLevel: Error,
+			DataBufioSize:1024,
+		},
     }
     srv := &http.Server{
         Handler: http.HandlerFunc(cp.ServeHTTP),
     }
-    l, err := net.Listen("tcp", "127.0.0.1:1320")
+    l, err := net.Listen("tcp", "127.0.0.1:0")
     if err != nil {
         t.Fatal(err)
     }
