@@ -7,7 +7,7 @@ set GOARCH=amd64
 go build -o ../bin/vproxy-win-amd64.exe  -gcflags "-N -l -m"
 
 cd /D ../bin/
-gdlv exec vproxy-win-amd64.exe -addr :80 -logLevel 7"
+gdlv exec vproxy-win-amd64.exe -addr :8081 -linkPosterior -proxy socks5://127.0.0.1:803 -logLevel 7
 
 pause
 exit 0

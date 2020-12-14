@@ -1,0 +1,8 @@
+module main
+
+go 1.15
+
+replace github.com/456vv/vsocks5 => ../../../vsocks5
+
+replace github.com/456vv/vproxy => ../../../vproxy
+
