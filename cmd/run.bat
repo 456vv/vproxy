@@ -4,10 +4,10 @@ set GOSUMDB=sum.golang.org
 
 set GOOS=windows
 set GOARCH=amd64
-go build -o ../bin/vproxy-win-amd64.exe  -gcflags "-N -l -m"
+go build -o ../bin/vproxy-win-amd64.exe  -gcflags "-N -l"
 
 cd /D ../bin/
-gdlv exec vproxy-win-amd64.exe -addr :8081 -linkPosterior -proxy socks5://127.0.0.1:803 -logLevel 7
+vproxy-win-amd64.exe -addr :8080 -linkPosterior -user p*P5 -pwd p*P5 -logLevel 4
 
 pause
 exit 0

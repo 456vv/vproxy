@@ -7,6 +7,7 @@ import (
     "golang.org/x/crypto/ssh"
     "net"
     "net/http"
+    "crypto/tls"
     "net/url"
     "time"
     "flag"
@@ -22,6 +23,8 @@ import (
 
 var (
     flog = flag.String("log", "", "日志文件(默认留空在控制台显示日志)  (format \"./vproxy.txt\")")
+    ftlsCertFile = flag.String("tlsCertFile", "", "SSl证书文件")
+    ftlsKeyFile = flag.String("tlsKeyFile", "", "SSl密钥文件")
     fuser = flag.String("user", "", "用户名")
     fpwd = flag.String("pwd", "", "密码")
     flogLevel = flag.Int("logLevel", 0, "日志级别，0)不记录 1)客户端IP 2)认证 3)访问的Host地址 4)路径 5)请求 6)响应 7)错误 (default 0)")
@@ -30,7 +33,7 @@ var (
     fidleConnTimeout = flag.Int64("idleConnTimeout", 0, "空闲连接超时时，单位毫秒 (default 0)")
     fdataBufioSize = flag.Int("dataBufioSize", 1024*10, "代理数据交换缓冲区大小，单位字节")
     ftimeout = flag.Int64("timeout", 300000, "转发连接请求超时，单位毫秒")
-    flinkPosterior = flag.Bool("linkPosterior", false, "支持连接式代理，如：http://111.222.333.444:8080/https://www.baidu.com/abc/file.zip")
+    flinkPosterior = flag.Bool("linkPosterior", false, "支持连接式代理，如：http://111.222.333.444:8080/?auth=user:pass&url=https://www.baidu.com/abc/file.zip")
 )
 
 func main(){
@@ -55,6 +58,17 @@ func main(){
         DataBufioSize: *fdataBufioSize,
         Addr        : *faddr,
         ErrorLogLevel: vproxy.LogLevel(*flogLevel),
+    }
+    if *ftlsCertFile != "" && *ftlsKeyFile != "" {
+    	cert, err := tls.LoadX509KeyPair(*ftlsCertFile, *ftlsKeyFile)
+    	if err != nil {
+    		fmt.Println(err)
+    		return
+    	}
+    	tlsConf := new(tls.Config)
+        tlsConf.Certificates = []tls.Certificate{cert}
+    	tlsConf.BuildNameToCertificate()
+    	p.Server.TLSConfig = tlsConf
     }
     p.ErrorLog = log.New(out, "", log.Lshortfile|log.LstdFlags)
     if *fuser != "" {
