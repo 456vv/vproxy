@@ -12,6 +12,7 @@ import (
     "net/url"
     "strconv"
     "context"
+    "crypto/tls"
 )
 
 const defaultDataBufioSize    = 1<<20                                                       // 默认数据缓冲1MB
@@ -31,6 +32,9 @@ const (
 
 type Proxy struct {
 	//这个支持单条连接。不要使用在浏览器中。
+	//支持：
+	//http://192.168.2.31/http://www.baidu.com/
+	//http://192.168.2.31/?url=http://www.baidu.com/
 	LinkPosterior	bool																	// 支持连接后面的，如：http://192.168.2.31/http://www.baidu.com/
     DataBufioSize   int                                                                     // 缓冲区大小
     Auth            func(username, password string) bool                                    // 认证
@@ -63,16 +67,36 @@ func (p *Proxy) ServeHTTP(rw http.ResponseWriter, req *http.Request){
     
     //认证用户密码
     if p.Auth != nil {
+    	var (
+    		username, password string
+    		ok bool
+    	)
         auth := req.Header.Get("Proxy-Authorization")
-        if auth == "" {
-            p.logf(Authenticate, "请求标头 Proxy-Authorization 没有被设置？")
-            http.Error(rw, "Proxy server requires authentication to log in!", http.StatusProxyAuthRequired)
-            return
+        if auth != "" {
+        	username, password, ok = parseBasicAuth(auth)
+        }else{
+        	query := req.URL.Query()
+        	auth = query.Get("auth")
+        	if auth != "" {
+        		query.Del("auth")
+	        	auths := strings.SplitN(auth, ":", 2)
+	        	if len(auths) != 2 {
+		            http.Error(rw, "Connection parameters 'auth=user:pass' not set? user or pass exist ':' use %3A substitute！", http.StatusNotImplemented)
+		            return
+        		}
+        		var err error
+        		username, err = url.QueryUnescape(auths[0])
+        		if err == nil {
+        			password, err = url.QueryUnescape(auths[1])
+        			ok = err == nil
+        		}
+	        }else{
+	            http.Error(rw, "Proxy server link/requires authentication to log in!", http.StatusProxyAuthRequired)
+	            return
+	        }
         }
-        username, password, ok := parseBasicAuth(auth)
         p.logf(Authenticate, "认证用户：%s，密码：%s", username, password)
         if !ok || !p.Auth(username, password){
-            p.logf(Authenticate, "用户或密码认证不通过？")
             http.Error(rw, "User or password is not valid!", http.StatusProxyAuthRequired)
             return
         }
@@ -80,25 +104,32 @@ func (p *Proxy) ServeHTTP(rw http.ResponseWriter, req *http.Request){
 	
 	var rewriteHost bool
 	if p.LinkPosterior {
-		//http://www.baidu.com/		错的
-		//http://www.baidu.com/a	对的
+		//http://www.baidu.com/			错的
+		//http://www.baidu.com/a		对的
+		//?url=http://www.baidu.com/*	对的
+		var rawurl string
 		if len(req.URL.Path) > 1 {
-			rawurl := req.URL.Path[1:]
-			if strings.Index(rawurl, "//") ==0 || strings.Index(rawurl, "http://") ==0 || strings.Index(rawurl, "https://") == 0 {
-				lpurl, err := url.Parse(rawurl)
-				if err != nil {
-    				p.logf(Host, "%s Host: %s", req.Method, req.Host)
-    				p.logf(URI, "连接路径错误: %s", req.RequestURI)
-            		http.Error(rw, "Connection path error!", http.StatusBadRequest)
-            		return
-				}
-				rewriteHost = true
-				req.Host = lpurl.Host
-				req.URL.Host = lpurl.Host
-				req.URL.Path = lpurl.Path
-				if lpurl.Scheme != "" {
-					req.URL.Scheme = lpurl.Scheme
-				}
+			rawurl = req.URL.Path[1:]
+		}else{
+			query := req.URL.Query()
+			rawurl = query.Get("url")
+        	query.Del("url")
+		}
+		
+		if strings.Index(rawurl, "//") ==0 || strings.Index(rawurl, "http://") ==0 || strings.Index(rawurl, "https://") == 0 {
+			lpurl, err := url.Parse(rawurl)
+			if err != nil {
+				p.logf(Host, "%s Host: %s", req.Method, req.Host)
+				p.logf(URI, "连接路径错误: %s", req.RequestURI)
+        		http.Error(rw, "Connection path error!", http.StatusBadRequest)
+        		return
+			}
+			rewriteHost = true
+			req.Host = lpurl.Host
+			req.URL.Host = lpurl.Host
+			req.URL.Path = lpurl.Path
+			if lpurl.Scheme != "" {
+				req.URL.Scheme = lpurl.Scheme
 			}
 		}
 	}
@@ -147,7 +178,6 @@ func (p *Proxy) ServeHTTP(rw http.ResponseWriter, req *http.Request){
 //  返：
 //      error       错误
 func (p *Proxy) ListenAndServe() error {
-    srv := p.initServer()
     addr := p.Addr
     if addr == "" {
         addr = ":0"
@@ -156,10 +186,7 @@ func (p *Proxy) ListenAndServe() error {
     if err != nil {
         return err
     }
-    p.l = l
-    p.Addr = l.Addr().String()
-    srv.Addr = p.Addr
-    return srv.Serve(tcpKeepAliveListener{l.(*net.TCPListener)})
+    return p.Serve(l)
 }
 
 //Serve 开启监听
@@ -172,7 +199,10 @@ func (p *Proxy) Serve(l net.Listener) error{
     p.l = l
     p.Addr = l.Addr().String()
     srv.Addr = p.Addr
-    return p.Server.Serve(l)
+    if srv.TLSConfig != nil {
+    	l = tls.NewListener(l, srv.TLSConfig)
+    }
+    return srv.Serve(l)
 }
 
 //Close 关闭
