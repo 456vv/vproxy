@@ -19,6 +19,7 @@ import (
     "bytes"
     "errors"
     "encoding/base64"
+    "sync"
 )
 
 var (
@@ -112,35 +113,59 @@ func main(){
 					ssh.KeyAlgoRSA,
 					ssh.KeyAlgoDSA,
 					ssh.KeyAlgoECDSA256,
+					ssh.KeyAlgoSKECDSA256,
 					ssh.KeyAlgoECDSA384,
 					ssh.KeyAlgoECDSA521,
 					ssh.KeyAlgoED25519,
+					ssh.KeyAlgoSKED25519,
 				},
-				Timeout: 5 * time.Second,
+				Timeout: 10 * time.Second,
 			}
 			
-			sshConn, client, err := sshDial("tcp", purl.Host, config)
+			var (
+			 	sshConnect bool
+			 	dialMux sync.Mutex
+			 	sshConn net.Conn
+			 	client *ssh.Client
+			 ) 
+			var sshReconn = func() error {
+				dialMux.Lock()
+				defer dialMux.Unlock()
+				if sshConnect {
+					return nil
+				}
+				
+				sshConn, client, err = sshDial("tcp", purl.Host, config)
+				if err != nil {
+					return err
+				}
+				sshConnect=true
+				go func(){
+					if cn, ok := sshConn.(vconn.CloseNotifier); ok {
+						select{
+						case err := <-cn.CloseNotify():
+							log.Println(err)
+							client.Close()
+							sshConnect=false
+						}
+					}
+				}()
+				return nil
+			}
+			err = sshReconn()
 			if err != nil {
 				fmt.Println("代理拨号错误: ", err)
-		        return
+	            return
 			}
-			defer func(){
-				client.Close()
-			}()
 			
 		    //connectProxy
 			p.DialContext = func(ctx context.Context, network, address string) (net.Conn, error){
-				if cn, ok := sshConn.(vconn.CloseNotifier); ok {
-					select {
-					case <-cn.CloseNotify():
-						sshConn, client, err = sshDial("tcp", purl.Host, config)
-						if err != nil {
-							return nil, err
-						}
-					default:
+				if !sshConnect {
+					err := sshReconn()
+					if err != nil {
+						return nil, err
 					}
 				}
-				
 				return client.Dial(network, address)
 			}
 			

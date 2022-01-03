@@ -2,6 +2,8 @@ cd /D ./main
 set GOPROXY=https://goproxy.cn,https://mirrors.aliyun.com/goproxy/,https://gocenter.io,https://proxy.golang.org,https://goproxy.io,https://athens.azurefd.net,direct
 set GOSUMDB=sum.golang.org
 
+go mod tidy
+
 set GOOS=windows
 set GOARCH=amd64
 go build -o ../bin/vproxy-win-amd64.exe -ldflags="-s -w"
