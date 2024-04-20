@@ -1,24 +1,22 @@
 cd /D ./main
-set GOPROXY=https://goproxy.cn,https://mirrors.aliyun.com/goproxy/,https://gocenter.io,https://proxy.golang.org,https://goproxy.io,https://athens.azurefd.net,direct
-set GOSUMDB=sum.golang.org
 
 go mod tidy
 
 set GOOS=windows
 set GOARCH=amd64
-go build -o ../bin/vproxy-win-amd64.exe -ldflags="-s -w"
+go build -o ../bin/vproxy-win-amd64.exe  -trimpath -ldflags="-s -w"
+go clean -cache
 
 set GOOS=linux
 set GOARCH=amd64
-go build -o ../bin/vproxy-linux-amd64 -ldflags="-s -w"
-set GOARCH=386
-go build -o ../bin/vproxy-linux-386 -ldflags="-s -w"
+go build -o ../bin/vproxy-linux-amd64 -trimpath -ldflags="-s -w"
 set GOARCH=arm
 set GOARM=7
-go build -o ../bin/vproxy-linux-armv7 -ldflags="-s -w"
+go build -o ../bin/vproxy-linux-armv7 -trimpath -ldflags="-s -w"
 set GOARCH=arm64
-go build -o ../bin/vproxy-linux-arm64 -ldflags="-s -w"
+go build -o ../bin/vproxy-linux-arm64 -trimpath -ldflags="-s -w"
 set GOARCH=mips
-go build -o ../bin/vproxy-linux-mips -ldflags="-s -w"
+go build -o ../bin/vproxy-linux-mips -trimpath -ldflags="-s -w"
+go clean -cache
 
 upx -9 ../bin/*
