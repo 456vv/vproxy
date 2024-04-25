@@ -74,12 +74,16 @@ func (p *Proxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		)
 		auth := req.Header.Get("Proxy-Authorization")
 		if auth != "" {
+			// 标头中读取
 			username, password, ok = parseBasicAuth(auth)
-		} else {
+		} else if username, password, ok = req.BasicAuth(); !ok {
+			// 在query中读取
 			query := req.URL.Query()
-			auth = query.Get("auth")
+			auth = query.Get("@auth")
 			if auth != "" {
-				query.Del("auth")
+				query.Del("@auth")
+				req.URL.RawQuery = query.Encode()
+
 				auths := strings.SplitN(auth, ":", 2)
 				if len(auths) != 2 {
 					http.Error(rw, "Connection parameters 'auth=user:pass' not set? user or pass exist ':' use %3A substitute！", http.StatusNotImplemented)
@@ -108,13 +112,17 @@ func (p *Proxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		//http://www.baidu.com/			错的
 		//http://www.baidu.com/a		对的
 		//?url=http://www.baidu.com/*	对的
-		var rawurl string
+
+		var (
+			rawurl string
+			query  = req.URL.Query()
+		)
 		if len(req.URL.Path) > 1 {
 			rawurl = req.URL.Path[1:]
 		} else {
-			query := req.URL.Query()
-			rawurl = query.Get("url")
-			query.Del("url")
+			rawurl = query.Get("@url")
+			query.Del("@url")
+			req.URL.RawQuery = query.Encode()
 		}
 		if strings.Index(rawurl, "//") == 0 || strings.Index(rawurl, "http://") == 0 || strings.Index(rawurl, "https://") == 0 {
 			lpurl, err := url.Parse(rawurl)
@@ -126,6 +134,7 @@ func (p *Proxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 			}
 			rewriteHost = true
 			req.Host = lpurl.Host
+			req.URL.User = nil
 			req.URL.Host = lpurl.Host
 			req.URL.Path = lpurl.Path
 			if lpurl.Scheme != "" {
@@ -176,7 +185,7 @@ func (p *Proxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		}
 		hp.ServeHTTP(rw, req)
 	}
-	p.logf(OriginAddr, "断开客户端IP: %s", req.RemoteAddr)
+	// p.logf(OriginAddr, "断开客户端IP: %s", req.RemoteAddr)
 }
 
 // ListenAndServe 开启监听
