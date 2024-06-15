@@ -1,6 +1,7 @@
 cd /D ./main
 
 go mod tidy
+go get -u
 
 set GOOS=windows
 set GOARCH=amd64

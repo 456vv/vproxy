@@ -74,6 +74,7 @@ func (p *Proxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		)
 		auth := req.Header.Get("Proxy-Authorization")
 		if auth != "" {
+			req.Header.Del("Proxy-Authorization")
 			// 标头中读取
 			username, password, ok = parseBasicAuth(auth)
 		} else if username, password, ok = req.BasicAuth(); !ok {
@@ -137,6 +138,7 @@ func (p *Proxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 			req.URL.User = nil
 			req.URL.Host = lpurl.Host
 			req.URL.Path = lpurl.Path
+			req.URL.RawQuery += "&" + lpurl.RawQuery
 			if lpurl.Scheme != "" {
 				req.URL.Scheme = lpurl.Scheme
 			}
@@ -169,7 +171,7 @@ func (p *Proxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	}
 
 	p.logf(Host, "%s Host: %s", req.Method, req.Host)
-	p.logf(URI, "URI: %s", req.RequestURI)
+	p.logf(URI, "URI: %s", req.URL.String())
 	p.logf(Request, "请求：\r\n%v", req)
 
 	// 请求
