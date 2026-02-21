@@ -2,7 +2,6 @@ package vproxy
 
 import (
 	"context"
-	"crypto/tls"
 	"encoding/base64"
 	"fmt"
 	"io"
@@ -12,7 +11,9 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
-	"time"
+
+	"github.com/456vv/vweb/v2"
+	"golang.org/x/crypto/acme/autocert"
 )
 
 const defaultDataBufioSize = 1 << 20 // 默认数据缓冲1MB
@@ -44,6 +45,7 @@ type Proxy struct {
 	ErrorLogLevel LogLevel                                                             // 日志级别
 	l             net.Listener                                                         // 连接对象
 	Tr            http.RoundTripper                                                    // 代理
+	CertManager   *autocert.Manager                                                    // 自动申请证书 Let's Encrypt
 }
 
 // initServer 初始化服务器
@@ -51,6 +53,14 @@ func (p *Proxy) initServer() *http.Server {
 	srv := &p.Server
 	if srv.Handler == nil {
 		srv.Handler = http.HandlerFunc(p.ServeHTTP)
+	}
+	if srv.TLSConfig != nil {
+		if srv.TLSConfig.NextProtos == nil {
+			srv.TLSConfig.NextProtos = []string{"http/1.1", "h2"}
+		}
+		if p.CertManager != nil {
+			srv.Handler = vweb.AutoCert(p.CertManager, srv.TLSConfig, srv.Handler)
+		}
 	}
 	return srv
 }
@@ -74,6 +84,7 @@ func (p *Proxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		)
 		auth := req.Header.Get("Proxy-Authorization")
 		if auth != "" {
+			req.Header.Del("Proxy-Authorization")
 			// 标头中读取
 			username, password, ok = parseBasicAuth(auth)
 		} else if username, password, ok = req.BasicAuth(); !ok {
@@ -107,24 +118,27 @@ func (p *Proxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		}
 	}
 
-	var rewriteHost bool
 	if p.LinkPosterior {
 		//http://www.baidu.com/			错的
 		//http://www.baidu.com/a		对的
-		//?url=http://www.baidu.com/*	对的
+		//?@url=http://www.baidu.com/*	对的
 
-		var (
-			rawurl string
-			query  = req.URL.Query()
-		)
+		var rawurl string
 		if len(req.URL.Path) > 1 {
 			rawurl = req.URL.Path[1:]
 		} else {
+			query := req.URL.Query()
 			rawurl = query.Get("@url")
-			query.Del("@url")
-			req.URL.RawQuery = query.Encode()
+			if rawurl != "" {
+				query.Del("@url")
+				req.URL.RawQuery = query.Encode()
+			}
 		}
-		if strings.Index(rawurl, "//") == 0 || strings.Index(rawurl, "http://") == 0 || strings.Index(rawurl, "https://") == 0 {
+		if rawurl != "" {
+			if !strings.Contains(rawurl, "//") {
+				rawurl = "//" + rawurl
+			}
+
 			lpurl, err := url.Parse(rawurl)
 			if err != nil {
 				p.logf(Host, "%s Host: %s", req.Method, req.Host)
@@ -132,26 +146,34 @@ func (p *Proxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 				http.Error(rw, "Connection path error!", http.StatusBadRequest)
 				return
 			}
-			rewriteHost = true
 			req.Host = lpurl.Host
-			req.URL.User = nil
+			req.URL.User = lpurl.User
 			req.URL.Host = lpurl.Host
 			req.URL.Path = lpurl.Path
+			if lpurl.RawQuery != "" {
+				if req.URL.RawQuery != "" {
+					lpurl.RawQuery = lpurl.RawQuery + "&" + req.URL.RawQuery
+				}
+				req.URL.RawQuery = lpurl.RawQuery
+			}
+
 			if lpurl.Scheme != "" {
 				req.URL.Scheme = lpurl.Scheme
 			}
 		}
-	} else if req.URL.Host == "" {
+	}
+
+	if req.URL.Host == "" {
 		p.logf(URI, "连接路径错误: %s", req.RequestURI)
 		http.Error(rw, "Connection path error!", http.StatusBadRequest)
 		return
 	}
 
-	if localAddr, ok := req.Context().Value(http.LocalAddrContextKey).(*net.TCPAddr); ok && !rewriteHost {
-		lhost := localAddr.IP.String()
-		rhost, _, _ := net.SplitHostPort(req.RemoteAddr)
+	if localAddr, ok := req.Context().Value(http.LocalAddrContextKey).(*net.TCPAddr); ok {
+		sip := localAddr.IP.String()
+		sport := localAddr.Port
+		cip, _, _ := net.SplitHostPort(req.RemoteAddr)
 
-		lport := localAddr.Port
 		_, rport, _ := net.SplitHostPort(req.Host)
 		if rport == "" {
 			switch req.URL.Scheme {
@@ -162,14 +184,14 @@ func (p *Proxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 			}
 		}
 		// 同Ip，同端口。拒绝循环
-		if lhost == rhost && strconv.Itoa(lport) == rport {
+		if sip == cip && strconv.Itoa(sport) == rport {
 			http.Error(rw, "Connection loopback  error!", http.StatusBadRequest)
 			return
 		}
 	}
 
 	p.logf(Host, "%s Host: %s", req.Method, req.Host)
-	p.logf(URI, "URI: %s", req.RequestURI)
+	p.logf(URI, "URI: %s", req.URL.String())
 	p.logf(Request, "请求：\r\n%v", req)
 
 	// 请求
@@ -215,16 +237,16 @@ func (p *Proxy) Serve(l net.Listener) error {
 	p.l = l
 	p.Addr = l.Addr().String()
 	srv.Addr = p.Addr
-	if srv.TLSConfig != nil {
-		l = tls.NewListener(l, srv.TLSConfig)
+
+	muxListener := &protocolMuxListener{
+		Listener:  l,
+		tlsConfig: srv.TLSConfig,
 	}
-	return srv.Serve(l)
+
+	return srv.Serve(muxListener)
 }
 
 // Close 关闭
-//
-//	返：
-//	    error       错误
 func (p *Proxy) Close() error {
 	if tr, ok := p.Tr.(*http.Transport); ok {
 		tr.CloseIdleConnections()
@@ -265,18 +287,4 @@ func parseBasicAuth(auth string) (username, password string, ok bool) {
 		return
 	}
 	return cs[:s], cs[s+1:], true
-}
-
-type tcpKeepAliveListener struct {
-	*net.TCPListener
-}
-
-func (ln tcpKeepAliveListener) Accept() (c net.Conn, err error) {
-	tc, err := ln.AcceptTCP()
-	if err != nil {
-		return
-	}
-	tc.SetKeepAlive(true)
-	tc.SetKeepAlivePeriod(3 * time.Minute)
-	return tc, nil
 }
