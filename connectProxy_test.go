@@ -1,76 +1,84 @@
 package vproxy
 
 import (
+	"bufio"
+	"context"
+	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"testing"
-
-	//"net/url"
-	"bufio"
-	"bytes"
-	"fmt"
-	"log"
 	"time"
+
+	"github.com/issue9/assert/v4"
 )
 
 func Test_connectProxy_ServeHTTP(t *testing.T) {
+	as := assert.New(t, true)
 	tests := []struct {
-		req    string
-		access string
+		method string
+		addr   string
+		url    string
 	}{
-		{req: "CONNECT www.baidu.com:80 HTTP/1.0\r\nHost:www.baidu.com:80\r\n\r\n", access: "GET / HTTP/1.1\r\nHost:www.baidu.com\r\nConnection:Close\r\n\r\n"},
-		{req: "CONNECT www.baidu.com:80 HTTP/1.1\r\nHost:www.baidu.com:80\r\n\r\n", access: "GET / HTTP/1.1\r\nHost:www.baidu.com\r\nConnection:Close\r\n\r\n"},
+		{method: http.MethodConnect, addr: "www.baidu.com:80", url: "http://www.baidu.com/index.html"},
 	}
 
 	cp := &proxyConnect{
-		Proxy: &Proxy{
+		proxy: &Proxy{
 			ErrorLog:      log.New(os.Stdout, "", log.LstdFlags),
 			ErrorLogLevel: Error,
-			DataBufioSize: 1024,
+			DialContext: func(ctx context.Context, network string, address string) (net.Conn, error) {
+				return net.Dial(network, address)
+			},
 		},
 	}
 	srv := &http.Server{
 		Handler: http.HandlerFunc(cp.ServeHTTP),
 	}
 	l, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
+	as.NotError(err)
+	defer l.Close()
+
 	laddr := l.Addr().String()
 	fmt.Println("服务器IP: ", laddr)
 	go srv.Serve(l)
 	time.Sleep(time.Second * 2)
 
-	resultStatus200NoCRCL := resultStatus200[:len(resultStatus200)-4]
 	for _, test := range tests {
+		// 连接代理服务器
 		netConn, err := net.Dial("tcp", laddr)
-		if err != nil {
-			t.Fatal(err)
-		}
-		netConn.Write([]byte(test.req))
-		bufioReader := bufio.NewReaderSize(netConn, 1024)
+		as.NotError(err)
 
-		line, _, err := bufioReader.ReadLine()
-		if err != nil {
-			t.Fatal(err)
+		// 要求代理服务器连接到WEB服务器
+		req := &http.Request{
+			Method: http.MethodConnect,
+			URL:    &url.URL{Opaque: test.addr},
+			Host:   test.addr,
+			Header: make(http.Header),
 		}
-		if !bytes.Equal(line, resultStatus200NoCRCL) {
-			t.Fatalf("返回的状态是： %s，实际状态是：%s", line, resultStatus200NoCRCL)
-		}
-		bufioReader.Reset(netConn)
+		err = req.Write(netConn)
+		as.NotError(err)
+		br := bufio.NewReader(netConn)
+		res, err := http.ReadResponse(br, req)
+		as.NotError(err)
+		as.Equal(res.Status, "200 Connection established")
 
-		netConn.Write([]byte(test.access))
+		// 请求代理服务器转发到WEB服务器
+		req, err = http.NewRequest("GET", test.url, nil)
+		as.NotError(err)
+		req.Header.Add("Connection", "Close")
+		err = req.Write(netConn)
+		as.NotError(err)
 
-		resp, err := http.ReadResponse(bufioReader, &http.Request{})
-		if err != nil {
-			t.Fatal(err)
-		}
-		if resp.StatusCode != http.StatusOK {
-			t.Fatalf("返回的状态号不是200，是：%d", resp.StatusCode)
-		}
-		io.Copy(io.Discard, resp.Body)
-		resp.Body.Close()
+		res, err = http.ReadResponse(br, req)
+		as.NotError(err)
+
+		as.Equal(res.StatusCode, http.StatusOK)
+		io.Copy(io.Discard, res.Body)
+		res.Body.Close()
+		netConn.Close()
 	}
 }
