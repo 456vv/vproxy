@@ -23,7 +23,10 @@ type proxyHTTP struct {
 
 type contextKey string
 
-const connCtxKey contextKey = "proxy-conn"
+const (
+	ctxKeyProxyConn  contextKey = "proxyConn"
+	ctxKeySkipVerify contextKey = "skipVerify"
+)
 
 type connHolder struct {
 	mu   sync.Mutex
@@ -53,7 +56,7 @@ func newProxyHTTP(p *Proxy) *proxyHTTP {
 	}
 	// http
 	phttp.Transport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
-		if holder, ok := ctx.Value(connCtxKey).(*connHolder); ok {
+		if holder, ok := ctx.Value(ctxKeyProxyConn).(*connHolder); ok {
 			if c := holder.Take(); c != nil {
 				return c, nil
 			}
@@ -69,7 +72,7 @@ func newProxyHTTP(p *Proxy) *proxyHTTP {
 
 	// ssl
 	phttp.Transport.DialTLSContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
-		if holder, ok := ctx.Value(connCtxKey).(*connHolder); ok {
+		if holder, ok := ctx.Value(ctxKeyProxyConn).(*connHolder); ok {
 			if c := holder.Take(); c != nil {
 				return c, nil
 			}
@@ -84,7 +87,16 @@ func newProxyHTTP(p *Proxy) *proxyHTTP {
 }
 
 func (T *proxyHTTP) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
-	cReq := req.Clone(req.Context())
+	ctx := req.Context()
+	query := req.URL.Query()
+	skipVerify := query.Get("@skipVerify")
+	if skipVerify == "true" {
+		ctx = context.WithValue(ctx, ctxKeySkipVerify, true)
+		query.Del("@skipVerify")
+		req.URL.RawQuery = query.Encode()
+	}
+
+	cReq := req.Clone(ctx)
 	cReq.RequestURI = ""
 	if ae := cReq.Header["Accept-Encoding"]; len(ae) > 0 {
 		cReq.Header["Accept-Encoding"] = []string{"gzip, deflate, br, zstd"}
@@ -162,7 +174,7 @@ func (T *proxyHTTP) RoundTrip(req *http.Request) (*http.Response, error) {
 		}
 
 		if req.URL.Scheme == "https" {
-			uConn, err := T.uConn(conn, targetAddr)
+			uConn, err := T.uConn(ctx, conn, targetAddr)
 			if err != nil {
 				conn.Close()
 				return nil, err
@@ -185,7 +197,7 @@ func (T *proxyHTTP) RoundTrip(req *http.Request) (*http.Response, error) {
 		}
 
 		holder := &connHolder{conn: conn}
-		ctx = context.WithValue(ctx, connCtxKey, holder)
+		ctx = context.WithValue(ctx, ctxKeyProxyConn, holder)
 		req = req.WithContext(ctx)
 
 		resp, err := T.Transport.RoundTrip(req)
@@ -216,16 +228,20 @@ func (T *proxyHTTP) http2ClientConn(conn net.Conn) (*http2.ClientConn, error) {
 	return t2.NewClientConn(conn)
 }
 
-func (T *proxyHTTP) uConn(conn net.Conn, targetAddr string) (*utls.UConn, error) {
+func (T *proxyHTTP) uConn(ctx context.Context, conn net.Conn, targetAddr string) (*utls.UConn, error) {
 	host, _, err := net.SplitHostPort(targetAddr)
 	if err != nil {
 		host = targetAddr
 	}
-	tlsConn := utls.UClient(conn, &utls.Config{
+	uconfig := &utls.Config{
 		ServerName:         host,
 		NextProtos:         []string{"h2", "http/1.1"},
 		InsecureSkipVerify: false, // Keep secure by default
-	}, utls.HelloChrome_Auto)
+	}
+	if skip, ok := ctx.Value(ctxKeySkipVerify).(bool); ok {
+		uconfig.InsecureSkipVerify = skip
+	}
+	tlsConn := utls.UClient(conn, uconfig, utls.HelloChrome_Auto)
 
 	tlsConn.SetDeadline(time.Now().Add(15 * time.Second))
 	if err := tlsConn.Handshake(); err != nil {
@@ -251,5 +267,5 @@ func (T *proxyHTTP) dialUTLS(ctx context.Context, network, addr string) (*utls.U
 	if err != nil {
 		return nil, err
 	}
-	return T.uConn(conn, addr)
+	return T.uConn(ctx, conn, addr)
 }
