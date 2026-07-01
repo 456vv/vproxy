@@ -1,8 +1,11 @@
 package vproxy
 
 import (
+	"bufio"
 	"context"
+	"crypto/tls"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -11,9 +14,14 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
-	"github.com/456vv/vweb/v2"
+	"github.com/456vv/vweb/v3"
 	"golang.org/x/crypto/acme/autocert"
+	"golang.org/x/crypto/ssh"
+
+	"golang.org/x/net/proxy"
 )
 
 const defaultDataBufioSize = 1 << 20 // 默认数据缓冲1MB
@@ -21,34 +29,39 @@ const defaultDataBufioSize = 1 << 20 // 默认数据缓冲1MB
 type LogLevel int
 
 const (
-	OriginAddr   LogLevel = iota + 1 // 登录 vproxy 每个请求的目标。
-	Authenticate                     // 认证
-	Host                             // 访问的Host地址
-	URI                              // 路径
-	Request                          // 显示报头解析
-	Response                         // 日志写入到网络的所有数据
-	Error                            // 非致命错误
+	OriginAddr LogLevel = iota + 1
+	Authenticate
+	Host
+	URI
+	Request
+	Response
+	Error
 )
 
-type Proxy struct {
-	// 这个支持单条连接。不要使用在浏览器中。
-	// 支持：
-	// http://192.168.2.31/http://www.baidu.com/
-	// http://192.168.2.31/?url=http://www.baidu.com/
-	LinkPosterior bool                                                                 // 支持连接后面的，如：http://192.168.2.31/http://www.baidu.com/
-	DataBufioSize int                                                                  // 缓冲区大小
-	Auth          func(username, password string) bool                                 // 认证
-	Addr          string                                                               // 代理IP地址
-	Server        http.Server                                                          // 服务器
-	DialContext   func(ctx context.Context, network, address string) (net.Conn, error) // 拨号
-	ErrorLog      *log.Logger                                                          // 日志
-	ErrorLogLevel LogLevel                                                             // 日志级别
-	l             net.Listener                                                         // 连接对象
-	Tr            http.RoundTripper                                                    // 代理
-	CertManager   *autocert.Manager                                                    // 自动申请证书 Let's Encrypt
+var defaultDial = &net.Dialer{
+	Timeout:   30 * time.Second,
+	KeepAlive: 30 * time.Second,
 }
 
-// initServer 初始化服务器
+type Proxy struct {
+	LinkPosterior bool
+	DataBufioSize int
+	Auth          func(username, password string) bool
+	Addr          string
+	Server        http.Server
+	DialContext   func(ctx context.Context, network, address string) (net.Conn, error)
+	ProxyURL      func(*http.Request) (*url.URL, error)
+	ErrorLog      *log.Logger
+	ErrorLogLevel LogLevel
+	CertManager   *autocert.Manager // 自动申请证书 Let's Encrypt
+	l             net.Listener
+	phttp         *proxyHTTP
+	pconn         *proxyConnect
+	initOnce      sync.Once // For safe lazy init
+	sshClient     *ssh.Client
+	sshMu         sync.Mutex // Added for SSH safety
+}
+
 func (p *Proxy) initServer() *http.Server {
 	srv := &p.Server
 	if srv.Handler == nil {
@@ -65,155 +78,201 @@ func (p *Proxy) initServer() *http.Server {
 	return srv
 }
 
-// ServeHTTP 处理服务
-//
-//	rw http.ResponseWriter  响应
-//	req *http.Request       请求
-func (p *Proxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
-	if p.Tr == nil {
-		p.Tr = http.DefaultTransport
-	}
+func (p *Proxy) resErr(rw http.ResponseWriter, err string) {
+	p.logf(Error, "%s", err)
+	http.Error(rw, err, http.StatusBadGateway)
+}
 
+func (p *Proxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	p.logf(OriginAddr, "接入客户端IP: %s", req.RemoteAddr)
 
-	// 认证用户密码
+	// Authentication
 	if p.Auth != nil {
-		var (
-			username, password string
-			ok                 bool
-		)
-		auth := req.Header.Get("Proxy-Authorization")
-		if auth != "" {
-			req.Header.Del("Proxy-Authorization")
-			// 标头中读取
-			username, password, ok = parseBasicAuth(auth)
-		} else if username, password, ok = req.BasicAuth(); !ok {
-			// 在query中读取
-			query := req.URL.Query()
-			auth = query.Get("@auth")
-			if auth != "" {
-				query.Del("@auth")
-				req.URL.RawQuery = query.Encode()
-
-				auths := strings.SplitN(auth, ":", 2)
-				if len(auths) != 2 {
-					http.Error(rw, "Connection parameters 'auth=user:pass' not set? user or pass exist ':' use %3A substitute！", http.StatusNotImplemented)
-					return
-				}
-				var err error
-				username, err = url.QueryUnescape(auths[0])
-				if err == nil {
-					password, err = url.QueryUnescape(auths[1])
-					ok = err == nil
-				}
-			} else {
-				http.Error(rw, "Proxy server link/requires authentication to log in!", http.StatusProxyAuthRequired)
-				return
-			}
+		username, password, ok := p.authenticate(req, rw)
+		if !ok {
+			return
 		}
 		p.logf(Authenticate, "认证用户：%s，密码：%s", username, password)
-		if !ok || !p.Auth(username, password) {
+		if !p.Auth(username, password) {
+			rw.Header().Set("Proxy-Authenticate", fmt.Sprintf(`Basic realm="%s"`, username))
 			http.Error(rw, "User or password is not valid!", http.StatusProxyAuthRequired)
 			return
 		}
 	}
 
-	if p.LinkPosterior {
-		//http://www.baidu.com/			错的
-		//http://www.baidu.com/a		对的
-		//?@url=http://www.baidu.com/*	对的
-
-		var rawurl string
-		if len(req.URL.Path) > 1 {
-			rawurl = req.URL.Path[1:]
-		} else {
-			query := req.URL.Query()
-			rawurl = query.Get("@url")
-			if rawurl != "" {
-				query.Del("@url")
-				req.URL.RawQuery = query.Encode()
-			}
-		}
-		if rawurl != "" {
-			if !strings.Contains(rawurl, "//") {
-				rawurl = "//" + rawurl
-			}
-
-			lpurl, err := url.Parse(rawurl)
-			if err != nil {
-				p.logf(Host, "%s Host: %s", req.Method, req.Host)
-				p.logf(URI, "连接路径错误: %s", req.RequestURI)
-				http.Error(rw, "Connection path error!", http.StatusBadRequest)
-				return
-			}
-			req.Host = lpurl.Host
-			req.URL.User = lpurl.User
-			req.URL.Host = lpurl.Host
-			req.URL.Path = lpurl.Path
-			if lpurl.RawQuery != "" {
-				if req.URL.RawQuery != "" {
-					lpurl.RawQuery = lpurl.RawQuery + "&" + req.URL.RawQuery
-				}
-				req.URL.RawQuery = lpurl.RawQuery
-			}
-
-			if lpurl.Scheme != "" {
-				req.URL.Scheme = lpurl.Scheme
-			}
-		}
-	}
-
-	if req.URL.Host == "" {
+	if p.LinkPosterior && !p.handleLinkPosterior(req, rw) {
+		return
+	} else if req.URL.Host == "" {
 		p.logf(URI, "连接路径错误: %s", req.RequestURI)
 		http.Error(rw, "Connection path error!", http.StatusBadRequest)
 		return
 	}
 
-	if localAddr, ok := req.Context().Value(http.LocalAddrContextKey).(*net.TCPAddr); ok {
-		sip := localAddr.IP.String()
-		sport := localAddr.Port
-		cip, _, _ := net.SplitHostPort(req.RemoteAddr)
+	// Anti-loopback
+	if err := p.checkLoopback(req); err != nil {
+		http.Error(rw, err.Error(), http.StatusBadGateway)
+		return
+	}
 
-		_, rport, _ := net.SplitHostPort(req.Host)
-		if rport == "" {
-			switch req.URL.Scheme {
-			case "http":
-				rport = "80"
-			case "https":
-				rport = "443"
-			}
-		}
-		// 同Ip，同端口。拒绝循环
-		if sip == cip && strconv.Itoa(sport) == rport {
-			http.Error(rw, "Connection loopback  error!", http.StatusBadRequest)
+	p.logf(Host, "%s Host: %s", req.Method, req.Host)
+	p.logf(URI, "URI: %s", req.RequestURI)
+	p.logf(Request, "请求：\r\n%v", req)
+
+	// Route request
+	if req.Method == http.MethodConnect {
+		p.getProxyConnect().ServeHTTP(rw, req)
+		return
+	}
+
+	// Clean proxy headers
+	p.cleanProxyHeaders(req)
+
+	p.getProxyHTTP().ServeHTTP(rw, req)
+}
+
+// Helper for safe lazy initialization
+func (p *Proxy) getProxyHTTP() *proxyHTTP {
+	if p.phttp == nil {
+		p.phttp = newProxyHTTP(p)
+	}
+	return p.phttp
+}
+
+func (p *Proxy) getProxyConnect() *proxyConnect {
+	if p.pconn == nil {
+		p.pconn = newProxyConnect(p)
+	}
+	return p.pconn
+}
+
+func (p *Proxy) authenticate(req *http.Request, rw http.ResponseWriter) (username, password string, ok bool) {
+	auth := req.Header.Get("Proxy-Authorization")
+	if auth != "" {
+		username, password, ok = parseBasicAuth(auth)
+		if ok {
 			return
 		}
 	}
 
-	p.logf(Host, "%s Host: %s", req.Method, req.Host)
-	p.logf(URI, "URI: %s", req.URL.String())
-	p.logf(Request, "请求：\r\n%v", req)
-
-	// 请求
-	switch req.Method {
-	case "CONNECT":
-		cp := &proxyConnect{
-			Proxy: p,
-		}
-		cp.ServeHTTP(rw, req)
-	default:
-		hp := &proxyHTTP{
-			Proxy: p,
-		}
-		hp.ServeHTTP(rw, req)
+	username, password, ok = req.BasicAuth()
+	if ok {
+		return
 	}
-	// p.logf(OriginAddr, "断开客户端IP: %s", req.RemoteAddr)
+
+	// Query param fallback
+	query := req.URL.Query()
+	auth = query.Get("@auth")
+	if auth == "" {
+		rw.Header().Set("Proxy-Authenticate", `Basic realm="Proxy"`)
+		http.Error(rw, "Proxy server requires authentication", http.StatusProxyAuthRequired)
+		return "", "", false
+	}
+
+	query.Del("@auth")
+	req.URL.RawQuery = query.Encode()
+
+	auths := strings.SplitN(auth, ":", 2)
+	if len(auths) != 2 {
+		http.Error(rw, "Invalid auth format. Use %3A for ':' in credentials", http.StatusNotImplemented)
+		return "", "", false
+	}
+
+	username, err1 := url.QueryUnescape(auths[0])
+	password, err2 := url.QueryUnescape(auths[1])
+	ok = err1 == nil && err2 == nil
+	return
 }
 
-// ListenAndServe 开启监听
-//
-//	返：
-//	    error       错误
+func (p *Proxy) handleLinkPosterior(req *http.Request, rw http.ResponseWriter) bool {
+	var rawurl string
+	if len(req.URL.Path) > 1 {
+		rawurl = req.URL.Path[1:]
+	} else {
+		query := req.URL.Query()
+		rawurl = query.Get("@url")
+		if rawurl != "" {
+			query.Del("@url")
+			req.URL.RawQuery = query.Encode()
+		}
+	}
+
+	if rawurl != "" {
+		if rawurl == "favicon.ico" {
+			http.Error(rw, "Connection path error!", http.StatusBadRequest)
+			return false
+		}
+		if !strings.Contains(rawurl, "//") {
+			rawurl = "//" + rawurl
+		}
+		lpurl, err := url.Parse(rawurl)
+		if err != nil {
+			p.logf(Host, "%s Host: %s", req.Method, req.Host)
+			p.logf(URI, "连接路径错误: %s", req.RequestURI)
+			http.Error(rw, "Connection path error!", http.StatusBadRequest)
+			return false
+		}
+
+		req.Host = lpurl.Host
+		req.URL.User = lpurl.User
+		req.URL.Host = lpurl.Host
+		req.URL.Path = lpurl.Path
+		if lpurl.RawQuery != "" {
+			if req.URL.RawQuery != "" {
+				lpurl.RawQuery = lpurl.RawQuery + "&" + req.URL.RawQuery
+			}
+			req.URL.RawQuery = lpurl.RawQuery
+		}
+
+		if lpurl.Scheme != "" {
+			req.URL.Scheme = lpurl.Scheme
+		}
+	}
+	return true
+}
+
+func (p *Proxy) checkLoopback(req *http.Request) error {
+	localAddr, ok := req.Context().Value(http.LocalAddrContextKey).(*net.TCPAddr)
+	if !ok {
+		return nil
+	}
+
+	lIP := localAddr.IP.String()
+	lPort := strconv.Itoa(localAddr.Port)
+
+	rIP, _, _ := net.SplitHostPort(req.RemoteAddr)
+	rHost, rPort, err := net.SplitHostPort(req.Host)
+	if err != nil {
+		rHost = req.Host
+
+		switch req.URL.Scheme {
+		case "http":
+			rPort = "80"
+		case "https":
+			rPort = "443"
+		}
+	}
+
+	if rHost == "localhost" || rHost == "127.0.0.1" || rHost == "::1" || rHost == lIP {
+		if lPort == rPort {
+			return fmt.Errorf("connection loopback error")
+		}
+	}
+
+	// 同Ip，同端口。拒绝循环
+	if lIP == rIP && lPort == rPort {
+		return fmt.Errorf("connection loopback error")
+	}
+	return nil
+}
+
+func (p *Proxy) cleanProxyHeaders(req *http.Request) {
+	for k := range req.Header {
+		if strings.HasPrefix(strings.ToLower(k), "proxy-") {
+			delete(req.Header, k)
+		}
+	}
+}
+
 func (p *Proxy) ListenAndServe() error {
 	addr := p.Addr
 	if addr == "" {
@@ -226,50 +285,224 @@ func (p *Proxy) ListenAndServe() error {
 	return p.Serve(l)
 }
 
-// Serve 开启监听
-//
-//	参：
-//	    l net.Listener  监听对象
-//	返：
-//	    error           错误
 func (p *Proxy) Serve(l net.Listener) error {
 	srv := p.initServer()
 	p.l = l
 	p.Addr = l.Addr().String()
-	srv.Addr = p.Addr
 
 	muxListener := &protocolMuxListener{
 		Listener:  l,
 		tlsConfig: srv.TLSConfig,
 	}
-
 	return srv.Serve(muxListener)
 }
 
-// Close 关闭
 func (p *Proxy) Close() error {
-	if tr, ok := p.Tr.(*http.Transport); ok {
-		tr.CloseIdleConnections()
-	}
 	if p.l != nil {
-		return p.l.Close()
+		p.l.Close()
 	}
+	if p.phttp != nil {
+		p.phttp.CloseIdleConnections()
+	}
+	p.sshMu.Lock()
+	if p.sshClient != nil {
+		p.sshClient.Close()
+		p.sshClient = nil
+	}
+	p.sshMu.Unlock()
 	return nil
 }
 
-func (p *Proxy) logf(level LogLevel, format string, v ...interface{}) error {
+func (p *Proxy) logf(level LogLevel, format string, v ...any) {
 	if p.ErrorLog != nil && p.ErrorLogLevel >= level {
-		err := fmt.Errorf(format+"\n", v...)
-		p.ErrorLog.Output(2, err.Error())
-		return err
+		p.ErrorLog.Output(2, fmt.Sprintf(format, v...))
 	}
-	return nil
 }
 
-func copyDate(dst io.Writer, src io.ReadCloser, bufSize int) (n int64, err error) {
+func (p *Proxy) proxyConnect(ctx context.Context, req *http.Request, targetAddr string) (net.Conn, error) {
+	purl, err := p.ProxyURL(req)
+	if err != nil {
+		return nil, err
+	}
+	var (
+		basic string
+		pwd   string
+	)
+	if purl.User != nil {
+		pwd, _ = purl.User.Password()
+		basic = basicAuth(purl.User.Username(), pwd)
+	}
+
+	network := "tcp"
+	paddr := host2addr(purl.Host, purl.Scheme)
+
+	switch purl.Scheme {
+	case "socks5", "socks5h", "socks4", "socks":
+		var auth *proxy.Auth
+		if purl.User != nil {
+			auth = &proxy.Auth{
+				User: purl.User.Username(),
+			}
+			auth.Password, _ = purl.User.Password()
+		}
+		var d proxy.Dialer
+		if p.DialContext != nil {
+			d = dialContext(p.DialContext)
+		} else {
+			d = dialContext(defaultDial.DialContext)
+		}
+		dialer, err := proxy.SOCKS5(network, paddr, auth, d)
+		if err != nil {
+			return nil, fmt.Errorf("socks5 dialer: %w", err)
+		}
+		if ctxDialer, ok := dialer.(proxy.ContextDialer); ok {
+			return ctxDialer.DialContext(ctx, network, targetAddr)
+		}
+		return dialer.Dial(network, targetAddr)
+	case "http":
+		var conn net.Conn
+		if p.DialContext != nil {
+			conn, err = p.DialContext(ctx, network, paddr)
+		} else {
+			conn, err = defaultDial.DialContext(ctx, network, paddr)
+		}
+		if err != nil {
+			return nil, err
+		}
+		return connProxy(ctx, conn, targetAddr, basic)
+	case "https":
+		hostname, _, err := net.SplitHostPort(targetAddr)
+		if err != nil {
+			hostname = targetAddr
+		}
+
+		var conn net.Conn
+		if p.DialContext != nil {
+			conn, err = p.DialContext(ctx, network, paddr)
+		} else {
+			conn, err = defaultDial.DialContext(ctx, network, paddr)
+		}
+		if err != nil {
+			return nil, err
+		}
+		tlsconfig := &tls.Config{
+			ServerName:         hostname,         // 证书验证
+			MinVersion:         tls.VersionTLS12, // 最低版本TLS1.2
+			InsecureSkipVerify: false,            // 忽略证书验证
+		}
+		if purl.Query().Get("skipVerify") == "true" {
+			tlsconfig.InsecureSkipVerify = true // 忽略证书验证
+		}
+		conn = tls.Client(conn, tlsconfig)
+		return connProxy(ctx, conn, targetAddr, basic)
+	case "ssh":
+		p.sshMu.Lock()
+		if p.sshClient != nil {
+			_, _, err := p.sshClient.Conn.SendRequest("keepalive@proxy.dev", true, nil)
+			if err == nil {
+				client := p.sshClient
+				p.sshMu.Unlock()
+				return client.DialContext(ctx, network, targetAddr)
+			}
+			p.sshClient.Close()
+			p.sshClient = nil
+		}
+		config := &ssh.ClientConfig{
+			User: purl.User.Username(),
+			Auth: []ssh.AuthMethod{
+				ssh.Password(pwd),
+			},
+			HostKeyCallback: func(hostname string, remote net.Addr, key ssh.PublicKey) error {
+				log.Println(hostname, remote, key)
+				return nil
+			},
+			HostKeyAlgorithms: []string{
+				ssh.KeyAlgoRSA,
+				ssh.KeyAlgoECDSA256,
+				ssh.KeyAlgoSKECDSA256,
+				ssh.KeyAlgoECDSA384,
+				ssh.KeyAlgoECDSA521,
+				ssh.KeyAlgoED25519,
+				ssh.KeyAlgoSKED25519,
+			},
+			Timeout: 10 * time.Second,
+		}
+
+		client, err := sshClient("tcp", paddr, config)
+		if err != nil {
+			p.sshMu.Unlock()
+			return nil, err
+		}
+		p.sshClient = client
+		p.sshMu.Unlock()
+		return client.DialContext(ctx, network, targetAddr)
+
+	}
+	return nil, fmt.Errorf("this %s proxy type does not support", purl.Scheme)
+}
+
+type dialContext func(ctx context.Context, network, address string) (net.Conn, error)
+
+func (d dialContext) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
+	return d(ctx, network, address)
+}
+
+func (d dialContext) Dial(network, address string) (net.Conn, error) {
+	return d(context.Background(), network, address)
+}
+
+// Improved copy with buffer pooling and better error handling
+var bufferPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, defaultDataBufioSize)
+		return &b
+	},
+}
+
+func copyDate(dst io.Writer, src io.ReadCloser, bufSize int) (int, error) {
 	defer src.Close()
-	buf := make([]byte, bufSize)
-	return io.CopyBuffer(dst, src, buf)
+
+	if bufSize <= 0 {
+		bufSize = defaultDataBufioSize
+	}
+
+	var fl http.Flusher
+	var fl2 interface{ Flush() error }
+
+	if f, ok := dst.(http.Flusher); ok {
+		fl = f
+	} else if f, ok := dst.(interface{ Flush() error }); ok {
+		fl2 = f
+	}
+
+	buf := bufferPool.Get().(*[]byte)
+	// Ensure capacity is sufficient before use
+	if cap(*buf) < bufSize {
+		*buf = make([]byte, bufSize)
+	}
+	defer bufferPool.Put(buf)
+
+	var total int
+	for {
+		n, err := src.Read((*buf)[:bufSize]) // Read into the available capacity
+		if n > 0 {
+			total += n
+			if _, werr := dst.Write((*buf)[:n]); werr != nil {
+				return total, werr
+			}
+			if fl != nil {
+				fl.Flush()
+			} else if fl2 != nil {
+				fl2.Flush()
+			}
+		}
+		if err != nil {
+			if err == io.EOF {
+				err = nil
+			}
+			return total, err
+		}
+	}
 }
 
 func parseBasicAuth(auth string) (username, password string, ok bool) {
@@ -287,4 +520,106 @@ func parseBasicAuth(auth string) (username, password string, ok bool) {
 		return
 	}
 	return cs[:s], cs[s+1:], true
+}
+
+func connProxy(ctx context.Context, conn net.Conn, address, basic string) (net.Conn, error) {
+	connectReq := &http.Request{
+		Method: "CONNECT",
+		URL:    &url.URL{Opaque: address},
+		Host:   address,
+		Header: make(http.Header),
+	}
+
+	if basic != "" {
+		connectReq.Header.Add("Proxy-Authorization", "Basic "+basic)
+	}
+
+	var (
+		connectCtx, cancel = context.WithTimeout(ctx, 1*time.Minute)
+		didReadResponse    = make(chan struct{})
+		resp               *http.Response
+		err                error
+		br                 *bufio.Reader
+	)
+	defer cancel()
+
+	go func() {
+		defer close(didReadResponse)
+		err = connectReq.Write(conn)
+		if err != nil {
+			return
+		}
+		br = bufio.NewReader(conn)
+		resp, err = http.ReadResponse(br, connectReq)
+	}()
+	select {
+	case <-connectCtx.Done():
+		conn.Close()
+		<-didReadResponse
+		return nil, connectCtx.Err()
+	case <-didReadResponse:
+		// resp or err now set
+	}
+	if err != nil {
+		conn.Close()
+		return nil, err
+	}
+	if resp.StatusCode != 200 {
+		conn.Close()
+		_, text, ok := strings.Cut(resp.Status, " ")
+		if !ok {
+			return nil, errors.New("unknown status code")
+		}
+		return nil, errors.New(text)
+	}
+	// 返回包裹的连接以防代理链预读数据丢失
+	return &bufferConn{Conn: conn, br: br}, nil
+}
+
+type bufferConn struct {
+	net.Conn
+	br *bufio.Reader
+}
+
+func (c *bufferConn) Read(b []byte) (int, error) {
+	return c.br.Read(b)
+}
+
+func (c *bufferConn) WriteTo(w io.Writer) (int64, error) {
+	return c.br.WriteTo(w)
+}
+
+func basicAuth(username, password string) string {
+	auth := username + ":" + password
+	return base64.StdEncoding.EncodeToString([]byte(auth))
+}
+
+func sshClient(network, addr string, config *ssh.ClientConfig) (*ssh.Client, error) {
+	conn, err := net.DialTimeout(network, addr, config.Timeout)
+	if err != nil {
+		return nil, err
+	}
+	c, chans, reqs, err := ssh.NewClientConn(conn, addr, config)
+	if err != nil {
+		conn.Close()
+		return nil, err
+	}
+
+	return ssh.NewClient(c, chans, reqs), nil
+}
+
+func sshKeepAlive(ctx context.Context, client *ssh.Client, interval time.Duration) {
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	for {
+		select {
+		case <-t.C:
+			_, _, err := client.Conn.SendRequest("keepalive@batproxy.dev", true, nil)
+			if err != nil {
+				return
+			}
+		case <-ctx.Done():
+			return
+		}
+	}
 }
