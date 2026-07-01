@@ -1,12 +1,9 @@
 package vproxy
 
 import (
-	"context"
-	"errors"
 	"io"
 	"net"
 	"net/http"
-	"strings"
 	"sync"
 	"time"
 )
@@ -26,29 +23,17 @@ func host2addr(host, scheme string) string {
 	rh, rp, err := net.SplitHostPort(host)
 	if err != nil {
 		rh = host
-		if strings.HasPrefix(rh, "[") && strings.HasSuffix(rh, "]") {
-			rh = rh[1 : len(rh)-1]
-		}
-		rp = "80"
-		if scheme == "https" {
-			rp = "443"
+		rp = "443"
+		if scheme == "http" {
+			rp = "80"
 		}
 	}
 	return net.JoinHostPort(rh, rp)
 }
 
-func (T *proxyConnect) resErr(rw http.ResponseWriter, err error) {
-	T.proxy.resErr(rw, err)
-}
-
 func (T *proxyConnect) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
-	if req.Method != http.MethodConnect {
-		T.proxy.logf(Error, "HTTP method is not %s", http.MethodConnect)
-		http.Error(rw, "Method Not Allowed", http.StatusMethodNotAllowed)
-		return
-	}
 	remoteAddr := host2addr(req.URL.Host, req.URL.Scheme)
-	ctx := context.Background()
+	ctx := req.Context()
 
 	var (
 		rConn net.Conn
@@ -63,19 +48,19 @@ func (T *proxyConnect) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	}
 
 	if err != nil {
-		T.resErr(rw, err)
+		T.proxy.resErr(rw, err.Error())
 		return
 	}
 
 	hj, ok := rw.(http.Hijacker)
 	if !ok {
-		T.resErr(rw, errors.New("http.ResponseWriter does not implement http.Hijacker"))
+		T.proxy.resErr(rw, "http.ResponseWriter does not implement http.Hijacker")
 		rConn.Close()
 		return
 	}
 	lConn, lrw, err := hj.Hijack()
 	if err != nil {
-		T.resErr(rw, err)
+		T.proxy.resErr(rw, err.Error())
 		rConn.Close()
 		return
 	}

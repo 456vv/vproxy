@@ -78,9 +78,9 @@ func (p *Proxy) initServer() *http.Server {
 	return srv
 }
 
-func (p *Proxy) resErr(rw http.ResponseWriter, err error) {
-	p.logf(Error, "%s", err.Error())
-	http.Error(rw, err.Error(), http.StatusBadGateway)
+func (p *Proxy) resErr(rw http.ResponseWriter, err string) {
+	p.logf(Error, "%s", err)
+	http.Error(rw, err, http.StatusBadGateway)
 }
 
 func (p *Proxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {

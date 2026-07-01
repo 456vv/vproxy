@@ -2,6 +2,7 @@ package vproxy
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -57,6 +58,9 @@ func newProxyHTTP(p *Proxy) *proxyHTTP {
 				return c, nil
 			}
 		}
+		if p.ProxyURL != nil {
+			return nil, errors.New("unable to read prepared connection")
+		}
 		if p.DialContext != nil {
 			return p.DialContext(ctx, network, addr)
 		}
@@ -70,26 +74,25 @@ func newProxyHTTP(p *Proxy) *proxyHTTP {
 				return c, nil
 			}
 		}
+		if p.ProxyURL != nil {
+			return nil, errors.New("unable to read prepared connection")
+		}
 		return phttp.dialUTLS(ctx, network, addr)
 	}
 
 	return phttp
 }
 
-func (T *proxyHTTP) resErr(rw http.ResponseWriter, err error) {
-	T.proxy.resErr(rw, err)
-}
-
 func (T *proxyHTTP) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
-	outReq := req.Clone(req.Context())
-	outReq.RequestURI = ""
-	if ae := outReq.Header["Accept-Encoding"]; len(ae) > 0 {
-		outReq.Header["Accept-Encoding"] = []string{"gzip, deflate, br, zstd"}
+	cReq := req.Clone(req.Context())
+	cReq.RequestURI = ""
+	if ae := cReq.Header["Accept-Encoding"]; len(ae) > 0 {
+		cReq.Header["Accept-Encoding"] = []string{"gzip, deflate, br, zstd"}
 	}
 
-	resp, err := T.RoundTrip(outReq)
+	resp, err := T.RoundTrip(cReq)
 	if err != nil {
-		T.resErr(rw, err)
+		T.proxy.resErr(rw, err.Error())
 		return
 	}
 
@@ -129,16 +132,12 @@ func copyHeaders(dst, src http.Header) {
 func (T *proxyHTTP) RoundTrip(req *http.Request) (*http.Response, error) {
 	if req.URL.Host != "" {
 		req.Host = req.URL.Host
-	}
-	if req.Host != "" {
+	} else if req.Host != "" {
 		req.URL.Host = req.Host
 	}
-	if req.URL.Scheme == "" {
-		req.URL.Scheme = "http"
-	}
 
-	ctx := req.Context()
 	targetAddr := host2addr(req.URL.Host, req.URL.Scheme)
+	ctx := req.Context()
 	// 尝试复用已有的 H2 连接
 	T.mu.RLock()
 	cc, ok := T.h2Conns[targetAddr]
