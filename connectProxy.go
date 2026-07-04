@@ -32,6 +32,11 @@ func host2addr(host, scheme string) string {
 }
 
 func (T *proxyConnect) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
+	if req.URL.Host == "" {
+		T.proxy.logf(URI, "连接路径错误: %s", req.RequestURI)
+		http.Error(rw, "Connection path error!", http.StatusBadRequest)
+		return
+	}
 	remoteAddr := host2addr(req.URL.Host, req.URL.Scheme)
 	ctx := req.Context()
 

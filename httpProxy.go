@@ -8,17 +8,22 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	utls "github.com/refraction-networking/utls"
 	"golang.org/x/net/http2"
 )
 
+type h2clientConn struct {
+	*http2.ClientConn
+	used atomic.Bool
+}
 type proxyHTTP struct {
 	*http.Transport
 	proxy   *Proxy
-	mu      sync.RWMutex                 // Use RWMutex for better concurrency
-	h2Conns map[string]*http2.ClientConn // H2 连接缓存 (per host)
+	mu      sync.RWMutex               // Use RWMutex for better concurrency
+	h2Conns map[string][]*h2clientConn // H2 连接缓存 (per host)\
 }
 
 type contextKey string
@@ -52,7 +57,7 @@ func newProxyHTTP(p *Proxy) *proxyHTTP {
 			ForceAttemptHTTP2: true,
 		},
 		proxy:   p,
-		h2Conns: make(map[string]*http2.ClientConn),
+		h2Conns: make(map[string][]*h2clientConn),
 	}
 	// http
 	phttp.Transport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
@@ -147,22 +152,41 @@ func (T *proxyHTTP) RoundTrip(req *http.Request) (*http.Response, error) {
 	} else if req.Host != "" {
 		req.URL.Host = req.Host
 	}
+	if req.URL.Scheme == "" {
+		req.URL.Scheme = "https"
+	}
 
 	targetAddr := host2addr(req.URL.Host, req.URL.Scheme)
 	ctx := req.Context()
 	// 尝试复用已有的 H2 连接
-	T.mu.RLock()
-	cc, ok := T.h2Conns[targetAddr]
-	T.mu.RUnlock()
-	if ok && cc.CanTakeNewRequest() {
-		if resp, err := cc.RoundTrip(req); err == nil {
+	T.mu.Lock()
+	var h2cc *h2clientConn
+	for _, cc := range T.h2Conns[targetAddr] {
+		if cc.CanTakeNewRequest() && !cc.used.Swap(true) {
+			h2cc = cc
+			break
+		}
+	}
+	T.mu.Unlock()
+	if h2cc != nil {
+		if resp, err := h2cc.RoundTrip(req); err == nil {
+			h2cc.used.Store(false)
 			return resp, nil
 		}
+
 		// Cleanup stale
 		T.mu.Lock()
-		if T.h2Conns[targetAddr] == cc {
+		h2cc.Close()
+		h2ccs := T.h2Conns[targetAddr]
+		if len(h2ccs) == 1 && h2ccs[0] == h2cc {
 			delete(T.h2Conns, targetAddr)
-			cc.Close()
+		} else {
+			for i, cc := range h2ccs {
+				if cc == h2cc {
+					T.h2Conns[targetAddr] = append(h2ccs[:i], h2ccs[i+1:]...)
+					break
+				}
+			}
 		}
 		T.mu.Unlock()
 	}
@@ -187,8 +211,11 @@ func (T *proxyHTTP) RoundTrip(req *http.Request) (*http.Response, error) {
 
 				}
 				T.mu.Lock()
-				T.h2Conns[targetAddr] = h2Conn
+				h2cc := &h2clientConn{ClientConn: h2Conn}
+				h2cc.used.Store(true)
+				T.h2Conns[targetAddr] = append(T.h2Conns[targetAddr], h2cc)
 				T.mu.Unlock()
+				defer h2cc.used.Store(false)
 				return h2Conn.RoundTrip(req)
 			}
 
@@ -213,8 +240,10 @@ func (T *proxyHTTP) RoundTrip(req *http.Request) (*http.Response, error) {
 func (T *proxyHTTP) CloseIdleConnections() {
 	T.mu.Lock()
 	defer T.mu.Unlock()
-	for k, cc := range T.h2Conns {
-		cc.Close()
+	for k, ccs := range T.h2Conns {
+		for _, cc := range ccs {
+			cc.Close()
+		}
 		delete(T.h2Conns, k)
 	}
 	T.Transport.CloseIdleConnections()

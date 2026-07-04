@@ -98,19 +98,12 @@ func (p *Proxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 			http.Error(rw, "User or password is not valid!", http.StatusProxyAuthRequired)
 			return
 		}
+	} else if err := p.checkLoopback(req); err != nil {
+		http.Error(rw, err.Error(), http.StatusBadGateway)
+		return
 	}
 
 	if p.LinkPosterior && !p.handleLinkPosterior(req, rw) {
-		return
-	} else if req.URL.Host == "" {
-		p.logf(URI, "连接路径错误: %s", req.RequestURI)
-		http.Error(rw, "Connection path error!", http.StatusBadRequest)
-		return
-	}
-
-	// Anti-loopback
-	if err := p.checkLoopback(req); err != nil {
-		http.Error(rw, err.Error(), http.StatusBadGateway)
 		return
 	}
 
@@ -606,20 +599,4 @@ func sshClient(network, addr string, config *ssh.ClientConfig) (*ssh.Client, err
 	}
 
 	return ssh.NewClient(c, chans, reqs), nil
-}
-
-func sshKeepAlive(ctx context.Context, client *ssh.Client, interval time.Duration) {
-	t := time.NewTicker(interval)
-	defer t.Stop()
-	for {
-		select {
-		case <-t.C:
-			_, _, err := client.Conn.SendRequest("keepalive@batproxy.dev", true, nil)
-			if err != nil {
-				return
-			}
-		case <-ctx.Done():
-			return
-		}
-	}
 }
