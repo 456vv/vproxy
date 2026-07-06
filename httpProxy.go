@@ -89,7 +89,8 @@ func cleanProxyHeaders(req *http.Request) {
 		}
 	}
 
-	req.Header.Set("referer", req.URL.String()) // 设置 referer 为当前请求的 URL
+	req.Header.Set("referer", req.URL.String())                 // 设置 referer 为当前请求的 URL
+	req.Header.Set("origin", req.URL.Scheme+"://"+req.URL.Host) // 设置 origin 为当前请求的协议和主机名
 }
 
 func (T *proxyHTTP) htt2Client(targetAddr string, req *http.Request) (*http.Response, bool) {
@@ -132,8 +133,9 @@ func (T *proxyHTTP) roundTrip(req *http.Request) (*http.Response, error) {
 	targetAddr := host2addr(req.URL.Host, req.URL.Scheme)
 
 	if req.URL.Scheme == "https" {
-		if res, ok := T.htt2Client(targetAddr, req); ok {
-			return res, nil
+		// 尝试复用现有 H2 连接
+		if resp, ok := T.htt2Client(targetAddr, req); ok {
+			return resp, nil
 		}
 
 		uConn, err := T.dialUTLS(ctx, "tcp", targetAddr)
@@ -148,16 +150,19 @@ func (T *proxyHTTP) roundTrip(req *http.Request) (*http.Response, error) {
 				return nil, fmt.Errorf("h2 client conn: %w", err)
 
 			}
-
-			defer func() {
-				T.mu.Lock()
-				defer T.mu.Unlock()
-				h2cc := &h2clientConn{ClientConn: h2Conn}
-				T.h2Conns[targetAddr] = append(T.h2Conns[targetAddr], h2cc)
-			}()
-			return h2Conn.RoundTrip(req)
+			resp, err := h2Conn.RoundTrip(req)
+			if err != nil {
+				h2Conn.Close()
+				return nil, err
+			}
+			// 请求成功，将连接加入池
+			T.mu.Lock()
+			T.h2Conns[targetAddr] = append(T.h2Conns[targetAddr], &h2clientConn{ClientConn: h2Conn})
+			T.mu.Unlock()
+			return resp, nil
 		}
 
+		// HTTP/1.1 over TLS
 		holder := &connHolder{conn: uConn}
 		ctx = context.WithValue(ctx, ctxKeyProxyConn, holder)
 		req = req.WithContext(ctx)
@@ -168,6 +173,7 @@ func (T *proxyHTTP) roundTrip(req *http.Request) (*http.Response, error) {
 		return resp, err
 	}
 
+	// HTTP (non-TLS)
 	req = req.WithContext(ctx)
 	return T.Transport.RoundTrip(req)
 }
@@ -188,17 +194,27 @@ func (T *proxyHTTP) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	}
 
 	cReq := req.WithContext(ctx)
-	cleanProxyHeaders(cReq)
 	cReq.RequestURI = ""
-	if ae := cReq.Header["Accept-Encoding"]; len(ae) > 0 {
-		cReq.Header["Accept-Encoding"] = []string{"gzip, deflate, br, zstd"}
+	if _, ok := cReq.Header["Accept-Encoding"]; !ok {
+		cReq.Header.Set("Accept-Encoding", "gzip, deflate, br, zstd")
 	}
 
-	resp, err := T.RoundTrip(cReq)
+	if cReq.URL.Host != "" {
+		cReq.Host = cReq.URL.Host
+	} else if cReq.Host != "" {
+		cReq.URL.Host = cReq.Host
+	}
+	if cReq.URL.Scheme == "" {
+		cReq.URL.Scheme = "https"
+	}
+
+	cleanProxyHeaders(cReq)
+	resp, err := T.roundTrip(cReq)
 	if err != nil {
 		T.proxy.resErr(rw, err.Error())
 		return
 	}
+	defer resp.Body.Close()
 
 	T.proxy.logf(Response, "响应：\r\n%v", resp)
 
@@ -214,15 +230,12 @@ func (T *proxyHTTP) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	}
 	rw.WriteHeader(resp.StatusCode)
 
-	if len(resp.Trailer) > 0 {
-		if fl, ok := rw.(http.Flusher); ok {
-			fl.Flush()
-		}
+	if fl, ok := rw.(http.Flusher); ok && len(resp.Trailer) > 0 {
+		fl.Flush()
 	}
 
 	// 优化 copyDate 调用，直接传递 Body
-	copyDate(rw, resp.Body, T.proxy.DataBufioSize)
-	resp.Body.Close()
+	copyData(rw, resp.Body, T.proxy.DataBufioSize)
 }
 
 func copyHeaders(dst, src http.Header) {
@@ -231,18 +244,6 @@ func copyHeaders(dst, src http.Header) {
 			dst.Add(k, v)
 		}
 	}
-}
-
-func (T *proxyHTTP) RoundTrip(req *http.Request) (*http.Response, error) {
-	if req.URL.Host != "" {
-		req.Host = req.URL.Host
-	} else if req.Host != "" {
-		req.URL.Host = req.Host
-	}
-	if req.URL.Scheme == "" {
-		req.URL.Scheme = "https"
-	}
-	return T.roundTrip(req)
 }
 
 func (T *proxyHTTP) CloseIdleConnections() {

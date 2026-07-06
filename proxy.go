@@ -122,16 +122,16 @@ func (p *Proxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 
 // Helper for safe lazy initialization
 func (p *Proxy) getProxyHTTP() *proxyHTTP {
-	if p.phttp == nil {
+	p.initOnce.Do(func() {
 		p.phttp = newProxyHTTP(p)
-	}
+	})
 	return p.phttp
 }
 
 func (p *Proxy) getProxyConnect() *proxyConnect {
-	if p.pconn == nil {
+	p.initOnce.Do(func() {
 		p.pconn = newProxyConnect(p)
-	}
+	})
 	return p.pconn
 }
 
@@ -243,7 +243,7 @@ func (p *Proxy) checkLoopback(req *http.Request) error {
 		switch req.URL.Scheme {
 		case "http":
 			rPort = "80"
-		case "https":
+		default:
 			rPort = "443"
 		}
 	}
@@ -319,7 +319,7 @@ func (p *Proxy) dial(ctx context.Context, network, addr string) (net.Conn, error
 func (p *Proxy) proxyConnect(ctx context.Context, network, targetAddr string) (net.Conn, error) {
 	req, ok := ctx.Value(ctxKeyRequest).(*http.Request)
 	if !ok {
-		return nil, errors.New("error context not http.request")
+		return nil, errors.New("context missing http.Request")
 	}
 
 	purl, err := p.ProxyURL(req)
@@ -351,12 +351,12 @@ func (p *Proxy) proxyConnect(ctx context.Context, network, targetAddr string) (n
 		} else {
 			d = dialContext(defaultDial.DialContext)
 		}
-		dialer, err := proxy.SOCKS5(network, paddr, auth, d)
+		dialer, err := proxy.SOCKS5("tcp", paddr, auth, d)
 		if err != nil {
 			return nil, fmt.Errorf("socks5 dialer: %w", err)
 		}
-		if ctxDialer, ok := dialer.(proxy.ContextDialer); ok {
-			return ctxDialer.DialContext(ctx, network, targetAddr)
+		if cd, ok := dialer.(proxy.ContextDialer); ok {
+			return cd.DialContext(ctx, network, targetAddr)
 		}
 		return dialer.Dial(network, targetAddr)
 	case "http":
@@ -386,12 +386,9 @@ func (p *Proxy) proxyConnect(ctx context.Context, network, targetAddr string) (n
 			return nil, err
 		}
 		tlsconfig := &tls.Config{
-			ServerName:         hostname,         // 证书验证
-			MinVersion:         tls.VersionTLS12, // 最低版本TLS1.2
-			InsecureSkipVerify: false,            // 忽略证书验证
-		}
-		if purl.Query().Get("skipVerify") == "true" {
-			tlsconfig.InsecureSkipVerify = true // 忽略证书验证
+			ServerName:         hostname,                                 // 证书验证
+			MinVersion:         tls.VersionTLS12,                         // 最低版本TLS1.2
+			InsecureSkipVerify: purl.Query().Get("skipVerify") == "true", // 忽略证书验证
 		}
 		conn = tls.Client(conn, tlsconfig)
 		return connProxy(ctx, conn, targetAddr, basic)
@@ -459,7 +456,7 @@ var bufferPool = sync.Pool{
 	},
 }
 
-func copyDate(dst io.Writer, src io.ReadCloser, bufSize int) (int, error) {
+func copyData(dst io.Writer, src io.ReadCloser, bufSize int) (int, error) {
 	defer src.Close()
 
 	if bufSize <= 0 {

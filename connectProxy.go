@@ -80,11 +80,11 @@ func (T *proxyConnect) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	rConn.SetDeadline(time.Time{})
 	var wg sync.WaitGroup
 	wg.Go(func() {
-		copyDate(lrw, rConn, T.proxy.DataBufioSize)
+		copyData(lrw, rConn, T.proxy.DataBufioSize)
 		lConn.Close()
 	})
 	wg.Go(func() {
-		copyDate(rConn, io.NopCloser(lrw), T.proxy.DataBufioSize)
+		copyData(rConn, io.NopCloser(lrw), T.proxy.DataBufioSize)
 		rConn.Close()
 	})
 	wg.Wait()
