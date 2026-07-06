@@ -1,9 +1,11 @@
 package vproxy
 
 import (
+	"context"
 	"io"
 	"net"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 )
@@ -28,25 +30,27 @@ func host2addr(host, scheme string) string {
 			rp = "80"
 		}
 	}
+
+	if strings.HasPrefix(rh, "[") && strings.HasSuffix(rh, "]") {
+		return rh + ":" + rp
+	}
 	return net.JoinHostPort(rh, rp)
 }
 
 func (T *proxyConnect) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
-	remoteAddr := host2addr(req.URL.Host, req.URL.Scheme)
-	ctx := req.Context()
-
-	var (
-		rConn net.Conn
-		err   error
-	)
-	if T.proxy.ProxyURL != nil {
-		rConn, err = T.proxy.proxyConnect(ctx, req, remoteAddr)
-	} else if T.proxy.DialContext != nil {
-		rConn, err = T.proxy.DialContext(ctx, "tcp", remoteAddr)
-	} else {
-		rConn, err = defaultDial.DialContext(ctx, "tcp", remoteAddr)
+	if req.URL.Host == "" {
+		T.proxy.logf(URI, "连接路径错误: %s", req.RequestURI)
+		http.Error(rw, "Connection path error!", http.StatusBadRequest)
+		return
 	}
 
+	var (
+		remoteAddr = host2addr(req.URL.Host, req.URL.Scheme)
+		ctx        = context.WithValue(req.Context(), ctxKeyRequest, req)
+		network    = "tcp"
+	)
+
+	rConn, err := T.proxy.dial(ctx, network, remoteAddr)
 	if err != nil {
 		T.proxy.resErr(rw, err.Error())
 		return
@@ -76,11 +80,11 @@ func (T *proxyConnect) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	rConn.SetDeadline(time.Time{})
 	var wg sync.WaitGroup
 	wg.Go(func() {
-		copyDate(lrw, rConn, T.proxy.DataBufioSize)
+		copyData(lrw, rConn, T.proxy.DataBufioSize)
 		lConn.Close()
 	})
 	wg.Go(func() {
-		copyDate(rConn, io.NopCloser(lrw), T.proxy.DataBufioSize)
+		copyData(rConn, io.NopCloser(lrw), T.proxy.DataBufioSize)
 		rConn.Close()
 	})
 	wg.Wait()
