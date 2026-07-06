@@ -117,9 +117,6 @@ func (p *Proxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	// Clean proxy headers
-	p.cleanProxyHeaders(req)
-
 	p.getProxyHTTP().ServeHTTP(rw, req)
 }
 
@@ -155,14 +152,20 @@ func (p *Proxy) authenticate(req *http.Request, rw http.ResponseWriter) (usernam
 	// Query param fallback
 	query := req.URL.Query()
 	auth = query.Get("@auth")
-	if auth == "" {
-		rw.Header().Set("Proxy-Authenticate", `Basic realm="Proxy"`)
-		http.Error(rw, "Proxy server requires authentication", http.StatusProxyAuthRequired)
-		return "", "", false
+	if auth != "" {
+		query.Del("@auth")
+		req.URL.RawQuery = query.Encode()
+	} else {
+		var upath string
+		var found bool
+		auth, upath, found = strings.Cut(req.URL.Path[1:], "/")
+		if !found || strings.HasSuffix(auth, ":") || !strings.Contains(auth, ":") {
+			rw.Header().Set("Proxy-Authenticate", `Basic realm="Proxy"`)
+			http.Error(rw, "Proxy server requires authentication", http.StatusProxyAuthRequired)
+			return "", "", false
+		}
+		req.URL.Path = "/" + upath
 	}
-
-	query.Del("@auth")
-	req.URL.RawQuery = query.Encode()
 
 	auths := strings.SplitN(auth, ":", 2)
 	if len(auths) != 2 {
@@ -258,14 +261,6 @@ func (p *Proxy) checkLoopback(req *http.Request) error {
 	return nil
 }
 
-func (p *Proxy) cleanProxyHeaders(req *http.Request) {
-	for k := range req.Header {
-		if strings.HasPrefix(strings.ToLower(k), "proxy-") {
-			delete(req.Header, k)
-		}
-	}
-}
-
 func (p *Proxy) ListenAndServe() error {
 	addr := p.Addr
 	if addr == "" {
@@ -312,7 +307,21 @@ func (p *Proxy) logf(level LogLevel, format string, v ...any) {
 	}
 }
 
-func (p *Proxy) proxyConnect(ctx context.Context, req *http.Request, targetAddr string) (net.Conn, error) {
+func (p *Proxy) dial(ctx context.Context, network, addr string) (net.Conn, error) {
+	if p.ProxyURL != nil {
+		return p.proxyConnect(ctx, network, addr)
+	} else if p.DialContext != nil {
+		return p.DialContext(ctx, network, addr)
+	}
+	return defaultDial.DialContext(ctx, network, addr)
+}
+
+func (p *Proxy) proxyConnect(ctx context.Context, network, targetAddr string) (net.Conn, error) {
+	req, ok := ctx.Value(ctxKeyRequest).(*http.Request)
+	if !ok {
+		return nil, errors.New("error context not http.request")
+	}
+
 	purl, err := p.ProxyURL(req)
 	if err != nil {
 		return nil, err
@@ -325,8 +334,6 @@ func (p *Proxy) proxyConnect(ctx context.Context, req *http.Request, targetAddr 
 		pwd, _ = purl.User.Password()
 		basic = basicAuth(purl.User.Username(), pwd)
 	}
-
-	network := "tcp"
 	paddr := host2addr(purl.Host, purl.Scheme)
 
 	switch purl.Scheme {

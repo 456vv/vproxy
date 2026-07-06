@@ -2,7 +2,6 @@ package vproxy
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -31,6 +30,8 @@ type contextKey string
 const (
 	ctxKeyProxyConn  contextKey = "proxyConn"
 	ctxKeySkipVerify contextKey = "skipVerify"
+	ctxKeyBrowserVer contextKey = "browserVer"
+	ctxKeyRequest    contextKey = "httpRequest"
 )
 
 type connHolder struct {
@@ -47,43 +48,33 @@ func (h *connHolder) Take() net.Conn {
 }
 
 func newProxyHTTP(p *Proxy) *proxyHTTP {
-	phttp := &proxyHTTP{
-		Transport: &http.Transport{
-			MaxIdleConns:        100, // Improved for performance
-			MaxIdleConnsPerHost: 10,  // Better reuse
-			IdleConnTimeout:     90 * time.Second,
-			DialContext:         defaultDial.DialContext,
-			// Enable HTTP/2 by default
-			ForceAttemptHTTP2: true,
-		},
-		proxy:   p,
-		h2Conns: make(map[string][]*h2clientConn),
+	tr := &http.Transport{
+		MaxIdleConns:        100, // Improved for performance
+		MaxIdleConnsPerHost: 10,  // Better reuse
+		IdleConnTimeout:     90 * time.Second,
 	}
+	phttp := &proxyHTTP{
+		Transport: tr,
+		proxy:     p,
+		h2Conns:   make(map[string][]*h2clientConn),
+	}
+
 	// http
-	phttp.Transport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+	tr.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
 		if holder, ok := ctx.Value(ctxKeyProxyConn).(*connHolder); ok {
 			if c := holder.Take(); c != nil {
 				return c, nil
 			}
 		}
-		if p.ProxyURL != nil {
-			return nil, errors.New("unable to read prepared connection")
-		}
-		if p.DialContext != nil {
-			return p.DialContext(ctx, network, addr)
-		}
-		return defaultDial.DialContext(ctx, network, addr)
+		return p.dial(ctx, network, addr)
 	}
 
 	// ssl
-	phttp.Transport.DialTLSContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+	tr.DialTLSContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
 		if holder, ok := ctx.Value(ctxKeyProxyConn).(*connHolder); ok {
 			if c := holder.Take(); c != nil {
 				return c, nil
 			}
-		}
-		if p.ProxyURL != nil {
-			return nil, errors.New("unable to read prepared connection")
 		}
 		return phttp.dialUTLS(ctx, network, addr)
 	}
@@ -91,17 +82,113 @@ func newProxyHTTP(p *Proxy) *proxyHTTP {
 	return phttp
 }
 
+func cleanProxyHeaders(req *http.Request) {
+	for k := range req.Header {
+		if strings.HasPrefix(strings.ToLower(k), "proxy-") {
+			delete(req.Header, k)
+		}
+	}
+
+	req.Header.Set("referer", req.URL.String()) // 设置 referer 为当前请求的 URL
+}
+
+func (T *proxyHTTP) htt2Client(targetAddr string, req *http.Request) (*http.Response, bool) {
+	T.mu.Lock()
+	var h2cc *h2clientConn
+	for _, cc := range T.h2Conns[targetAddr] {
+		if cc.CanTakeNewRequest() && !cc.used.Swap(true) {
+			h2cc = cc
+			break
+		}
+	}
+	T.mu.Unlock()
+	if h2cc != nil {
+		if resp, err := h2cc.RoundTrip(req); err == nil {
+			h2cc.used.Store(false)
+			return resp, true
+		}
+
+		// Cleanup stale
+		T.mu.Lock()
+		h2cc.Close()
+		h2ccs := T.h2Conns[targetAddr]
+		if len(h2ccs) == 1 && h2ccs[0] == h2cc {
+			delete(T.h2Conns, targetAddr)
+		} else {
+			for i, cc := range h2ccs {
+				if cc == h2cc {
+					T.h2Conns[targetAddr] = append(h2ccs[:i], h2ccs[i+1:]...)
+					break
+				}
+			}
+		}
+		T.mu.Unlock()
+	}
+	return nil, false
+}
+
+func (T *proxyHTTP) roundTrip(req *http.Request) (*http.Response, error) {
+	ctx := context.WithValue(req.Context(), ctxKeyRequest, req)
+	targetAddr := host2addr(req.URL.Host, req.URL.Scheme)
+
+	if req.URL.Scheme == "https" {
+		if res, ok := T.htt2Client(targetAddr, req); ok {
+			return res, nil
+		}
+
+		uConn, err := T.dialUTLS(ctx, "tcp", targetAddr)
+		if err != nil {
+			return nil, err
+		}
+
+		if uConn.ConnectionState().NegotiatedProtocol == "h2" {
+			h2Conn, err := T.http2ClientConn(uConn)
+			if err != nil {
+				uConn.Close()
+				return nil, fmt.Errorf("h2 client conn: %w", err)
+
+			}
+
+			defer func() {
+				T.mu.Lock()
+				defer T.mu.Unlock()
+				h2cc := &h2clientConn{ClientConn: h2Conn}
+				T.h2Conns[targetAddr] = append(T.h2Conns[targetAddr], h2cc)
+			}()
+			return h2Conn.RoundTrip(req)
+		}
+
+		holder := &connHolder{conn: uConn}
+		ctx = context.WithValue(ctx, ctxKeyProxyConn, holder)
+		req = req.WithContext(ctx)
+		resp, err := T.Transport.RoundTrip(req)
+		if unusedConn := holder.Take(); unusedConn != nil {
+			unusedConn.Close()
+		}
+		return resp, err
+	}
+
+	req = req.WithContext(ctx)
+	return T.Transport.RoundTrip(req)
+}
+
 func (T *proxyHTTP) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	ctx := req.Context()
 	query := req.URL.Query()
-	skipVerify := query.Get("@skipVerify")
-	if skipVerify == "true" {
+
+	if query.Get("@skipVerify") == "true" {
 		ctx = context.WithValue(ctx, ctxKeySkipVerify, true)
 		query.Del("@skipVerify")
 		req.URL.RawQuery = query.Encode()
 	}
+	if browserVer := query.Get("@browserVer"); browserVer != "" {
+		ctx = context.WithValue(ctx, ctxKeyBrowserVer, browserVer)
+		query.Del("@browserVer")
+		req.URL.RawQuery = query.Encode()
+	}
 
-	cReq := req.Clone(ctx)
+	cReq := req.WithContext(ctx)
+	cleanProxyHeaders(cReq)
 	cReq.RequestURI = ""
 	if ae := cReq.Header["Accept-Encoding"]; len(ae) > 0 {
 		cReq.Header["Accept-Encoding"] = []string{"gzip, deflate, br, zstd"}
@@ -155,86 +242,7 @@ func (T *proxyHTTP) RoundTrip(req *http.Request) (*http.Response, error) {
 	if req.URL.Scheme == "" {
 		req.URL.Scheme = "https"
 	}
-
-	targetAddr := host2addr(req.URL.Host, req.URL.Scheme)
-	ctx := req.Context()
-	// 尝试复用已有的 H2 连接
-	T.mu.Lock()
-	var h2cc *h2clientConn
-	for _, cc := range T.h2Conns[targetAddr] {
-		if cc.CanTakeNewRequest() && !cc.used.Swap(true) {
-			h2cc = cc
-			break
-		}
-	}
-	T.mu.Unlock()
-	if h2cc != nil {
-		if resp, err := h2cc.RoundTrip(req); err == nil {
-			h2cc.used.Store(false)
-			return resp, nil
-		}
-
-		// Cleanup stale
-		T.mu.Lock()
-		h2cc.Close()
-		h2ccs := T.h2Conns[targetAddr]
-		if len(h2ccs) == 1 && h2ccs[0] == h2cc {
-			delete(T.h2Conns, targetAddr)
-		} else {
-			for i, cc := range h2ccs {
-				if cc == h2cc {
-					T.h2Conns[targetAddr] = append(h2ccs[:i], h2ccs[i+1:]...)
-					break
-				}
-			}
-		}
-		T.mu.Unlock()
-	}
-
-	if T.proxy.ProxyURL != nil {
-		conn, err := T.proxy.proxyConnect(ctx, req, targetAddr)
-		if err != nil {
-			return nil, err
-		}
-
-		if req.URL.Scheme == "https" {
-			uConn, err := T.uConn(ctx, conn, targetAddr)
-			if err != nil {
-				conn.Close()
-				return nil, err
-			}
-			if uConn.ConnectionState().NegotiatedProtocol == "h2" {
-				h2Conn, err := T.http2ClientConn(uConn)
-				if err != nil {
-					uConn.Close()
-					return nil, fmt.Errorf("h2 client conn: %w", err)
-
-				}
-				T.mu.Lock()
-				h2cc := &h2clientConn{ClientConn: h2Conn}
-				h2cc.used.Store(true)
-				T.h2Conns[targetAddr] = append(T.h2Conns[targetAddr], h2cc)
-				T.mu.Unlock()
-				defer h2cc.used.Store(false)
-				return h2Conn.RoundTrip(req)
-			}
-
-			// h1
-			conn = uConn
-		}
-
-		holder := &connHolder{conn: conn}
-		ctx = context.WithValue(ctx, ctxKeyProxyConn, holder)
-		req = req.WithContext(ctx)
-
-		resp, err := T.Transport.RoundTrip(req)
-		if unusedConn := holder.Take(); unusedConn != nil {
-			unusedConn.Close()
-		}
-		return resp, err
-	}
-
-	return T.Transport.RoundTrip(req)
+	return T.roundTrip(req)
 }
 
 func (T *proxyHTTP) CloseIdleConnections() {
@@ -249,12 +257,12 @@ func (T *proxyHTTP) CloseIdleConnections() {
 	T.Transport.CloseIdleConnections()
 }
 
-func (T *proxyHTTP) http2ClientConn(conn net.Conn) (*http2.ClientConn, error) {
+func (T *proxyHTTP) http2ClientConn(uConn net.Conn) (*http2.ClientConn, error) {
 	t2 := &http2.Transport{
 		StrictMaxConcurrentStreams: true,
 		AllowHTTP:                  false,
 	}
-	return t2.NewClientConn(conn)
+	return t2.NewClientConn(uConn)
 }
 
 func (T *proxyHTTP) uConn(ctx context.Context, conn net.Conn, targetAddr string) (*utls.UConn, error) {
@@ -267,11 +275,17 @@ func (T *proxyHTTP) uConn(ctx context.Context, conn net.Conn, targetAddr string)
 		NextProtos:         []string{"h2", "http/1.1"},
 		InsecureSkipVerify: false, // Keep secure by default
 	}
+
 	if skip, ok := ctx.Value(ctxKeySkipVerify).(bool); ok {
 		uconfig.InsecureSkipVerify = skip
 	}
-	tlsConn := utls.UClient(conn, uconfig, utls.HelloChrome_Auto)
 
+	chromeVer := utls.HelloChrome_Auto
+	if ver, ok := ctx.Value(ctxKeyBrowserVer).(string); ok {
+		chromeVer = utls.ClientHelloID{Client: "Chrome", Version: ver, Seed: nil, Weights: nil}
+	}
+
+	tlsConn := utls.UClient(conn, uconfig, chromeVer)
 	tlsConn.SetDeadline(time.Now().Add(15 * time.Second))
 	if err := tlsConn.Handshake(); err != nil {
 		conn.Close()
@@ -284,15 +298,7 @@ func (T *proxyHTTP) uConn(ctx context.Context, conn net.Conn, targetAddr string)
 }
 
 func (T *proxyHTTP) dialUTLS(ctx context.Context, network, addr string) (*utls.UConn, error) {
-	var (
-		conn net.Conn
-		err  error
-	)
-	if T.proxy.DialContext != nil {
-		conn, err = T.proxy.DialContext(ctx, network, addr)
-	} else {
-		conn, err = defaultDial.DialContext(ctx, network, addr)
-	}
+	conn, err := T.proxy.dial(ctx, network, addr)
 	if err != nil {
 		return nil, err
 	}

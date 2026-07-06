@@ -1,9 +1,11 @@
 package vproxy
 
 import (
+	"context"
 	"io"
 	"net"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 )
@@ -28,6 +30,10 @@ func host2addr(host, scheme string) string {
 			rp = "80"
 		}
 	}
+
+	if strings.HasPrefix(rh, "[") && strings.HasSuffix(rh, "]") {
+		return rh + ":" + rp
+	}
 	return net.JoinHostPort(rh, rp)
 }
 
@@ -37,21 +43,14 @@ func (T *proxyConnect) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		http.Error(rw, "Connection path error!", http.StatusBadRequest)
 		return
 	}
-	remoteAddr := host2addr(req.URL.Host, req.URL.Scheme)
-	ctx := req.Context()
 
 	var (
-		rConn net.Conn
-		err   error
+		remoteAddr = host2addr(req.URL.Host, req.URL.Scheme)
+		ctx        = context.WithValue(req.Context(), ctxKeyRequest, req)
+		network    = "tcp"
 	)
-	if T.proxy.ProxyURL != nil {
-		rConn, err = T.proxy.proxyConnect(ctx, req, remoteAddr)
-	} else if T.proxy.DialContext != nil {
-		rConn, err = T.proxy.DialContext(ctx, "tcp", remoteAddr)
-	} else {
-		rConn, err = defaultDial.DialContext(ctx, "tcp", remoteAddr)
-	}
 
+	rConn, err := T.proxy.dial(ctx, network, remoteAddr)
 	if err != nil {
 		T.proxy.resErr(rw, err.Error())
 		return
