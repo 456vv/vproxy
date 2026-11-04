@@ -27,7 +27,7 @@ func (l *protocolMuxListener) Accept() (net.Conn, error) {
 			return conn, nil
 		}
 
-		// 设置读取截止时间，防止阻塞过久
+		// 设置读取截止时间，防止慢连接无限阻塞 Accept 循环
 		if err := conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
 			conn.Close()
 			continue
@@ -36,8 +36,8 @@ func (l *protocolMuxListener) Accept() (net.Conn, error) {
 		// 2. 包装连接以便我们可以“偷看”前几个字节
 		reader := bufio.NewReader(conn)
 
-		// 3. 偷看前 5 个字节
-		peeked, err := reader.Peek(5)
+		// TLS 握手记录首字节 0x16 即可判断，使用 Peek(1) 降低延迟与失败率
+		peeked, err := reader.Peek(1)
 		if err != nil {
 			// 如果连接失效或读取超时，直接关闭连接继续等待下一个，避免使主 Listener 崩溃
 			conn.Close()
@@ -54,10 +54,7 @@ func (l *protocolMuxListener) Accept() (net.Conn, error) {
 			br:   reader,
 		}
 
-		// 4. 判断协议类型
-		// TLS 握手消息的起始字节 (0x16)
-		if len(peeked) >= 1 && peeked[0] == 0x16 {
-			// 创建一个包装器，将偷看的数据重新放回流中
+		if peeked[0] == 0x16 {
 			tlsConn := tls.Server(bc, l.tlsConfig)
 			return tlsConn, nil
 		}

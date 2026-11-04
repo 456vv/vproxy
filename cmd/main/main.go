@@ -32,6 +32,8 @@ var (
 	fdataBufioSize = flag.Int("dataBufioSize", 1024*10, "代理数据交换缓冲区大小，单位字节")
 	ftimeout       = flag.String("timeout", "5s", "转发连接请求超时，单位：ns, us, ms, s, m, h")
 	flinkPosterior = flag.Bool("linkPosterior", false, "支持连接式代理，如：http://111.222.333.444:8080/?@auth=user:pass&@url=https://www.baidu.com/abc/file.zip")
+	fknownHosts    = flag.String("knownHosts", "", "SSH 代理使用的 known_hosts 文件路径（多个用逗号分隔，留空尝试 ~/.ssh/known_hosts）")
+	finsecureSSH   = flag.Bool("insecureSSH", false, "跳过 SSH 上游 host key 校验（仅调试用，存在 MITM 风险）")
 )
 
 func main() {
@@ -43,7 +45,7 @@ func main() {
 	}
 	var out io.Writer = os.Stdout
 	if *flog != "" {
-		file, err := os.OpenFile(*flog, os.O_CREATE|os.O_RDWR, 0o777)
+		file, err := os.OpenFile(*flog, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o777)
 		if err != nil {
 			fmt.Println(err)
 			return
@@ -60,6 +62,10 @@ func main() {
 		ErrorLog:      log.New(out, "", log.Lshortfile|log.LstdFlags),
 	}
 
+	p.InsecureIgnoreHostKey = *finsecureSSH
+	if *fknownHosts != "" {
+		p.KnownHostsFiles = strings.Split(*fknownHosts, ",")
+	}
 	tlsconf := new(tls.Config)
 	if *ftlsCertFile != "" && *ftlsKeyFile != "" {
 		cert, err := tls.LoadX509KeyPair(*ftlsCertFile, *ftlsKeyFile)
@@ -98,15 +104,19 @@ func main() {
 		DualStack: true,
 		KeepAliveConfig: net.KeepAliveConfig{
 			Enable:   true,
-			Idle:     0,
-			Interval: 0,
+			Idle:     30*time.Second,
+			Interval: 15*time.Second,
 			Count:    0,
 		},
 	}
 	if *ftimeout != "" {
-		if d, err := time.ParseDuration(*ftimeout); err == nil {
-			dialer.Timeout = d
+		// 解析失败时显式报错并退出，避免用户误以为超时已生效。
+		d, err := time.ParseDuration(*ftimeout)
+		if err != nil {
+			fmt.Printf("解析 -timeout=%q 失败: %v\n", *ftimeout, err)
+			return
 		}
+		dialer.Timeout = d
 	}
 	p.DialContext = dialer.DialContext
 

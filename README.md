@@ -1,34 +1,188 @@
+
 # vproxy
-vproxy是一个命令行工具，支持HTTP/HTTPS协议代理服务器。
 
-命令行：
------------------------------------
+高性能 HTTP/HTTPS 代理服务器，支持上游代理链式转发、TLS 指纹伪装、HTTP/2、认证、自动证书等功能。
 
-命令行例子：vproxy -addr 0.0.0.0:8080
+## 特性
+
+- **HTTP / HTTPS 代理**：完整支持普通请求与 `CONNECT` 隧道
+- **同端口协议复用**：HTTP 与 HTTPS 可在同一端口监听（TLS 嗅探）
+- **上游代理支持**：
+  - HTTP / HTTPS
+  - SOCKS5 / SOCKS5h
+  - SSH 隧道（带 host key 校验）
+- **TLS 指纹伪装**：基于 [utls](https://github.com/refraction-networking/utls) 模拟 Chrome ClientHello
+- **HTTP/2 连接池**：自动协商与复用 h2 连接
+- **认证**：Basic Auth（Header / 路径 / Query 多种方式）
+- **证书**：
+  - 自定义证书
+  - Let's Encrypt 自动申请（autocert）
+- **安全防护**：
+  - 自环检测（防止代理连自己）
+  - 无认证时禁止访问本机任意地址
+- **连接式代理（LinkPosterior）**：支持把目标 URL 嵌入路径
+- **可配置日志级别**、缓冲区大小、超时等
+
+## 安装
+
+### 从源码构建
+
+```bash
+git clone https://github.com/456vv/vproxy.git
+cd vproxy
+go build -o vproxy ./cmd/main
 ```
--addr string
-    代理服务器地 (format "0.0.0.0:8080")
--dataBufioSize int
-    代理数据交换缓冲区大小，单位字节 (default 10240)
--idleConnTimeout int
-    空闲连接超时时，单位毫秒 (default 0)
--linkPosterior
-    支持连接式代理，如：http://111.222.333.444:8080/https://www.baidu.com/abc/file.zip
--log string
-    日志文件(默认留空在控制台显示日志)  (format "./vproxy.txt")
--logLevel int
-    日志级别，0)不记录 1)客户端IP 2)认证 3)访问的Host地址 4)路径 5)请求 6)响应 7)错误 (default 0)
--proxy string
-    代理服务器的上级代理IP地址 (format "http://11.22.33.44:8888" or "socks5://admin:admin@11.22.33.44:1080")
--pwd string
-    密码
--timeout int
-    转发连接请求超时，单位毫秒 (default 300000)
--tlsCertFile string
-    SSl证书文件
--tlsKeyFile string
-    SSl密钥文件
--user string
-    用户名
+
+### 直接运行
+
+```bash
+go run ./cmd/main -addr 0.0.0.0:8080
+```
+
+## 快速开始
+
+```bash
+# 最简单启动（本地 8080）
+./vproxy -addr 127.0.0.1:8080
+
+# 对外开放 + 开启认证
+./vproxy -addr 0.0.0.0:8080 -user admin -pwd 123456
+
+# 开启详细日志
+./vproxy -addr 0.0.0.0:8080 -logLevel 7
+
+# 使用上游代理
+./vproxy -addr 0.0.0.0:8080 -proxy "socks5://user:pass@1.2.3.4:1080"
+```
+
+## 命令行参数
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `-addr` | `127.0.0.1:8080` | 监听地址 |
+| `-user` / `-pwd` | 空 | 认证用户名 / 密码 |
+| `-proxy` | 空 | 上游代理地址，支持 `http://`、`https://`、`socks5://`、`socks5h://`、`ssh://` |
+| `-timeout` | `5s` | 转发连接超时（支持 `ns/us/ms/s/m/h`） |
+| `-dataBufioSize` | `10240` | 数据交换缓冲区大小（字节） |
+| `-log` | 空 | 日志文件路径（空则输出到控制台） |
+| `-logLevel` | `0` | 日志级别：0不记录 1客户端IP 2认证 3Host 4路径 5请求 6响应 7错误 |
+| `-linkPosterior` | `false` | 启用连接式代理（目标 URL 写在路径中） |
+| `-tlsCertFile` / `-tlsKeyFile` | 空 | 自定义 TLS 证书与密钥 |
+| `-autoCertCache` | 空 | 自动证书缓存目录 |
+| `-autoCertHost` | 空 | 允许自动申请证书的域名（多个用逗号分隔） |
+| `-knownHosts` | 空 | SSH 代理使用的 known_hosts 文件（多个用逗号分隔） |
+| `-insecureSSH` | `false` | 跳过 SSH host key 校验（仅调试，有 MITM 风险） |
+
+## 使用示例
+
+### 1. 带认证的代理
+
+```bash
+./vproxy -addr 0.0.0.0:8080 -user myuser -pwd mypass
+```
+
+客户端可使用：
 
 ```
+http://myuser:mypass@proxy-ip:8080
+```
+
+也支持在路径或 Query 中传递认证信息（适合某些特殊场景）。
+
+### 2. 上游 SOCKS5 / HTTP 代理
+
+```bash
+# SOCKS5
+./vproxy -addr 0.0.0.0:8080 -proxy "socks5://user:pass@1.2.3.4:1080"
+
+# HTTP 上游
+./vproxy -addr 0.0.0.0:8080 -proxy "http://1.2.3.4:8888"
+
+# HTTPS 上游（可跳过证书校验）
+./vproxy -addr 0.0.0.0:8080 -proxy "https://1.2.3.4:8443?skipVerify=true"
+```
+
+### 3. SSH 上游代理
+
+```bash
+./vproxy -addr 0.0.0.0:8080 \
+  -proxy "ssh://user:password@ssh-server:22" \
+  -knownHosts ~/.ssh/known_hosts
+```
+
+调试时可临时关闭 host key 校验：
+
+```bash
+./vproxy -addr 0.0.0.0:8080 \
+  -proxy "ssh://user:password@ssh-server:22" \
+  -insecureSSH
+```
+
+### 4. TLS 服务端（自定义证书）
+
+```bash
+./vproxy -addr 0.0.0.0:443 \
+  -tlsCertFile /path/to/cert.pem \
+  -tlsKeyFile /path/to/key.pem
+```
+
+### 5. 自动申请 Let's Encrypt 证书
+
+```bash
+./vproxy -addr 0.0.0.0:443 \
+  -autoCertCache ./certs \
+  -autoCertHost "proxy.example.com,www.proxy.example.com"
+```
+
+### 6. 连接式代理（LinkPosterior）
+
+启用后可通过路径直接指定目标：
+
+```bash
+./vproxy -addr 0.0.0.0:8080 -linkPosterior
+```
+
+访问示例：
+
+```
+http://proxy-ip:8080/https://www.example.com/path/to/file
+http://proxy-ip:8080/?@url=https://www.example.com/abc&@auth=user:pass
+```
+
+### 7. 跳过目标站点证书校验 / 指定浏览器指纹
+
+在请求 Query 中添加参数（仅对本请求生效）：
+
+```
+http://proxy/https://example.com?@skipVerify=true
+http://proxy/https://example.com?@browserVer=120
+```
+
+## 架构简述
+
+```
+客户端
+  │
+  ▼
+protocolMuxListener（嗅探 TLS / 明文 HTTP）
+  │
+  ▼
+http.Server
+  │
+  ├─ CONNECT  → proxyConnect（隧道转发）
+  └─ 普通请求 → proxyHTTP
+                  ├─ H2 连接池复用
+                  ├─ utls 指纹握手
+                  └─ 上游代理（HTTP/SOCKS5/SSH）
+```
+
+## 注意事项
+
+1. **无认证时禁止访问本机**：为防止 SSRF，未设置 `-user` 时无法访问 `localhost`、`127.0.0.1`、本机网卡 IP 等。
+2. **自环保护**：即使开启认证，也不允许目标地址指向代理自身监听端口。
+3. **SSH 安全**：默认严格校验 host key。生产环境请配置正确的 `known_hosts`，不要使用 `-insecureSSH`。
+4. **缓冲区**：高并发或大文件场景可适当调大 `-dataBufioSize`。
+
+## License
+
+Apache 2.0
