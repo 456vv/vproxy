@@ -38,7 +38,7 @@ func host2addr(host, scheme string) string {
 }
 
 func (T *proxyConnect) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
-	if req.URL.Host == "" {
+	if req.URL == nil || req.URL.Host == "" {
 		T.proxy.logf(URI, "连接路径错误: %s", req.RequestURI)
 		http.Error(rw, "Connection path error!", http.StatusBadRequest)
 		return
@@ -79,13 +79,18 @@ func (T *proxyConnect) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	lConn.SetDeadline(time.Time{})
 	rConn.SetDeadline(time.Time{})
 	var wg sync.WaitGroup
-	wg.Go(func() {
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
 		copyData(lrw, rConn, T.proxy.DataBufioSize)
-		lConn.Close()
-	})
-	wg.Go(func() {
+		// 一端结束时关闭对端写，促使另一端尽快退出。
+		_ = lConn.Close()
+	}()
+	go func() {
+		defer wg.Done()
+		// lrw 实现了 io.Reader，用 NopCloser 统一接口。
 		copyData(rConn, io.NopCloser(lrw), T.proxy.DataBufioSize)
-		rConn.Close()
-	})
+		_ = rConn.Close()
+	}()
 	wg.Wait()
 }

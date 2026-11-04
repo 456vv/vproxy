@@ -7,16 +7,15 @@ import (
 	"net/http"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	utls "github.com/refraction-networking/utls"
 	"golang.org/x/net/http2"
 )
 
+const maxH2ConnsPerHost = 10 // 修复 #7：每 host 最多缓存 10 个 h2 连接
 type h2clientConn struct {
 	*http2.ClientConn
-	used atomic.Bool
 }
 type proxyHTTP struct {
 	*http.Transport
@@ -88,54 +87,100 @@ func cleanProxyHeaders(req *http.Request) {
 			delete(req.Header, k)
 		}
 	}
-
-	req.Header.Set("referer", req.URL.String())                 // 设置 referer 为当前请求的 URL
-	req.Header.Set("origin", req.URL.Scheme+"://"+req.URL.Host) // 设置 origin 为当前请求的协议和主机名
 }
 
-func (T *proxyHTTP) htt2Client(targetAddr string, req *http.Request) (*http.Response, bool) {
-	T.mu.Lock()
+func (T *proxyHTTP) http2Client(poolKey string, req *http.Request) (*http.Response, bool) {
+	T.mu.RLock()
 	var h2cc *h2clientConn
-	for _, cc := range T.h2Conns[targetAddr] {
-		if cc.CanTakeNewRequest() && !cc.used.Swap(true) {
+	for _, cc := range T.h2Conns[poolKey] {
+		if cc.CanTakeNewRequest() {
 			h2cc = cc
 			break
 		}
 	}
-	T.mu.Unlock()
+	T.mu.RUnlock()
+
 	if h2cc != nil {
-		if resp, err := h2cc.RoundTrip(req); err == nil {
-			h2cc.used.Store(false)
+		resp, err := h2cc.RoundTrip(req)
+		if err == nil {
 			return resp, true
 		}
-
-		// Cleanup stale
-		T.mu.Lock()
-		h2cc.Close()
-		h2ccs := T.h2Conns[targetAddr]
-		if len(h2ccs) == 1 && h2ccs[0] == h2cc {
-			delete(T.h2Conns, targetAddr)
-		} else {
-			for i, cc := range h2ccs {
-				if cc == h2cc {
-					T.h2Conns[targetAddr] = append(h2ccs[:i], h2ccs[i+1:]...)
-					break
-				}
-			}
+		// RoundTrip 失败时 resp 可能非 nil，其 Body 需关闭避免 H2 stream 泄漏。
+		if resp != nil && resp.Body != nil {
+			_ = resp.Body.Close()
 		}
-		T.mu.Unlock()
+		// 清理失效连接
+		T.removeH2Conn(poolKey, h2cc)
 	}
 	return nil, false
 }
 
+// removeH2Conn 从池中移除指定 h2 连接并关闭
+func (T *proxyHTTP) removeH2Conn(poolKey string, h2cc *h2clientConn) {
+	T.mu.Lock()
+	defer T.mu.Unlock()
+	h2cc.Close()
+	ccs := T.h2Conns[poolKey]
+	for i, cc := range ccs {
+		if cc == h2cc {
+			T.h2Conns[poolKey] = append(ccs[:i], ccs[i+1:]...)
+			break
+		}
+	}
+	if len(T.h2Conns[poolKey]) == 0 {
+		delete(T.h2Conns, poolKey)
+	}
+}
+
+// h2PoolKey 生成 H2 连接池 key，必须包含影响 TLS 握手的参数。
+func h2PoolKey(ctx context.Context, targetAddr string) string {
+	skipVerify, _ := ctx.Value(ctxKeySkipVerify).(bool)
+	browserVer, _ := ctx.Value(ctxKeyBrowserVer).(string)
+	if !skipVerify && browserVer == "" {
+		return targetAddr
+	}
+	return fmt.Sprintf("%t|%s|%s", skipVerify, browserVer, targetAddr)
+}
+
+// resetRequestBody 在 H2 复用尝试失败后，若 Body 可重放则重建 Body。
+// 因为 htt2Client 内部复用的 h2 连接 RoundTrip 失败时，req.Body 可能已被读走；
+// 若不重置，后续回退到 dialUTLS 新拨号会发送空 Body，导致目标端收到空请求体。
+func resetRequestBody(req *http.Request) error {
+	if req == nil || req.Body == nil || req.Body == http.NoBody || req.GetBody == nil {
+		return nil
+	}
+	newBody, err := req.GetBody()
+	if err != nil {
+		return err
+	}
+	// 旧 Body 可能已被部分读取，关闭避免泄漏；重复 Close 通常无害。
+	_ = req.Body.Close()
+	req.Body = newBody
+	return nil
+}
+
 func (T *proxyHTTP) roundTrip(req *http.Request) (*http.Response, error) {
-	ctx := context.WithValue(req.Context(), ctxKeyRequest, req)
+	// 始终用 req.Context() 派生，保证 skipVerify/browserVer 与后续 dial 一致。
+	ctx := req.Context()
+	ctx = context.WithValue(ctx, ctxKeyRequest, req)
 	targetAddr := host2addr(req.URL.Host, req.URL.Scheme)
+	// H2 连接池 key 包含 skipVerify/browserVer，避免不安全连接被复用。
+	poolKey := h2PoolKey(ctx, targetAddr)
 
 	if req.URL.Scheme == "https" {
 		// 尝试复用现有 H2 连接
-		if resp, ok := T.htt2Client(targetAddr, req); ok {
-			return resp, nil
+		// 若 Body 不可重放（GetBody==nil 且 Body 非空），复用 H2 连接
+		// 时若 RoundTrip 失败，Body 已被读走，后续回退拨号会发送空 Body。
+		// 仅在 Body 为空或可重放时才尝试复用。
+		canReuse := req.Body == nil || req.Body == http.NoBody || req.GetBody != nil
+		if canReuse {
+			if resp, ok := T.http2Client(poolKey, req); ok {
+				return resp, nil
+			}
+			// H2 复用失败后重置可重放的 Body，避免后续回退拨号发送空 Body。
+			if err := resetRequestBody(req); err != nil {
+				return nil, err
+			}
 		}
 
 		uConn, err := T.dialUTLS(ctx, "tcp", targetAddr)
@@ -155,10 +200,18 @@ func (T *proxyHTTP) roundTrip(req *http.Request) (*http.Response, error) {
 				h2Conn.Close()
 				return nil, err
 			}
-			// 请求成功，将连接加入池
+			// 请求成功，将连接加入池（按 poolKey 分桶）
 			T.mu.Lock()
-			T.h2Conns[targetAddr] = append(T.h2Conns[targetAddr], &h2clientConn{ClientConn: h2Conn})
+			var oldToClose *h2clientConn
+			if ccs := T.h2Conns[poolKey]; len(ccs) >= maxH2ConnsPerHost {
+				oldToClose = ccs[0]
+				T.h2Conns[poolKey] = ccs[1:]
+			}
+			T.h2Conns[poolKey] = append(T.h2Conns[poolKey], &h2clientConn{ClientConn: h2Conn})
 			T.mu.Unlock()
+			if oldToClose != nil {
+				oldToClose.Close()
+			}
 			return resp, nil
 		}
 
@@ -180,6 +233,11 @@ func (T *proxyHTTP) roundTrip(req *http.Request) (*http.Response, error) {
 
 func (T *proxyHTTP) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	ctx := req.Context()
+	// 防御 URL 为 nil 的请求（正常代理请求不会出现，避免 panic）。
+	if req.URL == nil {
+		T.proxy.resErr(rw, "request URL is nil")
+		return
+	}
 	query := req.URL.Query()
 
 	if query.Get("@skipVerify") == "true" {
@@ -193,11 +251,9 @@ func (T *proxyHTTP) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		req.URL.RawQuery = query.Encode()
 	}
 
+	// 必须 WithContext，否则 roundTrip 内 h2PoolKey/dialUTLS 读不到 skipVerify/browserVer。
 	cReq := req.WithContext(ctx)
 	cReq.RequestURI = ""
-	if _, ok := cReq.Header["Accept-Encoding"]; !ok {
-		cReq.Header.Set("Accept-Encoding", "gzip, deflate, br, zstd")
-	}
 
 	if cReq.URL.Host != "" {
 		cReq.Host = cReq.URL.Host
@@ -209,6 +265,9 @@ func (T *proxyHTTP) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	}
 
 	cleanProxyHeaders(cReq)
+	// 清理请求端逐跳头，避免转发给上游。
+
+	removeHopHeaders(cReq.Header)
 	resp, err := T.roundTrip(cReq)
 	if err != nil {
 		T.proxy.resErr(rw, err.Error())
@@ -217,6 +276,9 @@ func (T *proxyHTTP) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	defer resp.Body.Close()
 
 	T.proxy.logf(Response, "响应：\r\n%v", resp)
+
+	// 清理响应端逐跳头；resp.Header 由 Transport 每次新建，可直接修改。
+	removeHopHeaders(resp.Header)
 
 	wh := rw.Header()
 	copyHeaders(wh, resp.Header)
@@ -236,6 +298,12 @@ func (T *proxyHTTP) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 
 	// 优化 copyDate 调用，直接传递 Body
 	copyData(rw, resp.Body, T.proxy.DataBufioSize)
+
+	for k, vv := range resp.Trailer {
+		for _, v := range vv {
+			rw.Header().Add(http.TrailerPrefix+k, v)
+		}
+	}
 }
 
 func copyHeaders(dst, src http.Header) {
@@ -260,13 +328,12 @@ func (T *proxyHTTP) CloseIdleConnections() {
 
 func (T *proxyHTTP) http2ClientConn(uConn net.Conn) (*http2.ClientConn, error) {
 	t2 := &http2.Transport{
-		StrictMaxConcurrentStreams: true,
-		AllowHTTP:                  false,
+		AllowHTTP: false,
 	}
 	return t2.NewClientConn(uConn)
 }
 
-func (T *proxyHTTP) uConn(ctx context.Context, conn net.Conn, targetAddr string) (*utls.UConn, error) {
+func (T *proxyHTTP) newUTLSConn(ctx context.Context, conn net.Conn, targetAddr string) (*utls.UConn, error) {
 	host, _, err := net.SplitHostPort(targetAddr)
 	if err != nil {
 		host = targetAddr
@@ -282,7 +349,9 @@ func (T *proxyHTTP) uConn(ctx context.Context, conn net.Conn, targetAddr string)
 	}
 
 	chromeVer := utls.HelloChrome_Auto
-	if ver, ok := ctx.Value(ctxKeyBrowserVer).(string); ok {
+	if ver, ok := ctx.Value(ctxKeyBrowserVer).(string); ok && ver != "" {
+		// 注意：utls 对未知 Version 可能 panic（取决于 utls 内部实现）。
+		// 空字符串走 HelloChrome_Auto；非空由用户保证是 utls 已知版本，否则风险自负。
 		chromeVer = utls.ClientHelloID{Client: "Chrome", Version: ver, Seed: nil, Weights: nil}
 	}
 
@@ -303,5 +372,33 @@ func (T *proxyHTTP) dialUTLS(ctx context.Context, network, addr string) (*utls.U
 	if err != nil {
 		return nil, err
 	}
-	return T.uConn(ctx, conn, addr)
+	return T.newUTLSConn(ctx, conn, addr)
+}
+
+// hopHeaders 是 RFC 7230 §6.1 定义的逐跳头，代理不应转发。
+var hopHeaders = []string{
+	"Connection",
+	"Proxy-Connection",
+	"Keep-Alive",
+	"Proxy-Authenticate",
+	"Proxy-Authorization",
+	"Te",
+	"Trailer",
+	"Transfer-Encoding",
+	"Upgrade",
+}
+
+// removeHopHeaders 删除逐跳头，以及 Connection 头中列出的其他头。符合 RFC 7230 §6.1。
+func removeHopHeaders(h http.Header) {
+	// 先读取 Connection 值，再删除（删除后无法读取）。
+	if c := h.Get("Connection"); c != "" {
+		for _, f := range strings.Split(c, ",") {
+			if f = strings.TrimSpace(f); f != "" {
+				h.Del(f)
+			}
+		}
+	}
+	for _, k := range hopHeaders {
+		h.Del(k)
+	}
 }
