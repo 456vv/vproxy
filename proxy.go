@@ -105,7 +105,7 @@ func hasProto(protos []string, want string) bool {
 }
 
 func (p *Proxy) resErr(rw http.ResponseWriter, err string) {
-	p.logf(Error, "%s", err)
+	p.callLogf(3, Error, "%s", err)
 	http.Error(rw, err, http.StatusBadGateway)
 }
 
@@ -362,6 +362,7 @@ func (p *Proxy) handleLinkPosterior(req *http.Request, rw http.ResponseWriter) b
 		rawurl = req.URL.Path[1:]
 	} else {
 		query := req.URL.Query()
+		rawurl = query.Get("@url")
 		if rawurl != "" {
 			query.Del("@url")
 			req.URL.RawQuery = query.Encode()
@@ -383,7 +384,7 @@ func (p *Proxy) handleLinkPosterior(req *http.Request, rw http.ResponseWriter) b
 					break
 				}
 			}
-			if !fixed {
+			if !fixed && !strings.HasPrefix(rawurl, "/") {
 				rawurl = "//" + rawurl
 			}
 		}
@@ -396,10 +397,19 @@ func (p *Proxy) handleLinkPosterior(req *http.Request, rw http.ResponseWriter) b
 			return false
 		}
 
-		req.Host = lpurl.Host
-		req.URL.User = lpurl.User
-		req.URL.Host = lpurl.Host
-		req.URL.Path = lpurl.Path
+		if lpurl.Host != "" {
+			req.Host = lpurl.Host
+			req.URL.Host = lpurl.Host
+		}
+		if lpurl.User != nil {
+			req.URL.User = lpurl.User
+		}
+		if lpurl.Path != "" {
+			req.URL.Path = lpurl.Path
+		}
+		if lpurl.Scheme != "" {
+			req.URL.Scheme = lpurl.Scheme
+		}
 		if lpurl.RawQuery != "" {
 			if req.URL.RawQuery != "" {
 				lpurl.RawQuery = lpurl.RawQuery + "&" + req.URL.RawQuery
@@ -407,9 +417,6 @@ func (p *Proxy) handleLinkPosterior(req *http.Request, rw http.ResponseWriter) b
 			req.URL.RawQuery = lpurl.RawQuery
 		}
 
-		if lpurl.Scheme != "" {
-			req.URL.Scheme = lpurl.Scheme
-		}
 	}
 	return true
 }
@@ -462,8 +469,12 @@ func (p *Proxy) Close() error {
 }
 
 func (p *Proxy) logf(level LogLevel, format string, v ...any) {
+	p.callLogf(2, level, format, v...)
+}
+
+func (p *Proxy) callLogf(calldepth int, level LogLevel, format string, v ...any) {
 	if p.ErrorLog != nil && p.ErrorLogLevel >= level {
-		p.ErrorLog.Output(2, fmt.Sprintf(format, v...))
+		p.ErrorLog.Output(calldepth, fmt.Sprintf(format, v...))
 	}
 }
 
@@ -495,17 +506,8 @@ func (p *Proxy) proxyConnect(ctx context.Context, network, targetAddr string) (n
 		pwd, _ = purl.User.Password()
 		basic = basicAuth(purl.User.Username(), pwd)
 	}
-	paddr := host2addr(purl.Host, purl.Scheme)
 
-	if localAddr, ok := req.Context().Value(http.LocalAddrContextKey).(*net.TCPAddr); ok {
-		upHost, _, _ := net.SplitHostPort(paddr)
-		if upHost == "" {
-			upHost = paddr
-		}
-		if isSelfHost(upHost, localAddr.IP) {
-			return nil, fmt.Errorf("upstream proxy %q points to proxy itself", purl.Host)
-		}
-	}
+	paddr := host2addr(purl.Host, purl.Scheme)
 	switch purl.Scheme {
 	case "socks5", "socks5h":
 		var auth *proxy.Auth
