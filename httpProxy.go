@@ -261,7 +261,18 @@ func (T *proxyHTTP) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		cReq.URL.Host = cReq.Host
 	}
 	if cReq.URL.Scheme == "" {
-		cReq.URL.Scheme = "https"
+		switch _, port := targetHostPort(cReq); port {
+		case "80":
+			cReq.URL.Scheme = "http"
+		case "443":
+			cReq.URL.Scheme = "https"
+		default:
+			if cReq.TLS == nil {
+				cReq.URL.Scheme = "http"
+			} else {
+				cReq.URL.Scheme = "https"
+			}
+		}
 	}
 
 	cleanProxyHeaders(cReq)
